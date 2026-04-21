@@ -1,0 +1,446 @@
+---
+title: "Structure_Learning_Visualisations"
+author: "Jonah Yallop"
+date: "2026-02-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(patchwork)
+library(ggplot2)
+```
+
+# 1. Alpha sensitivity visualisations
+
+```{r}
+# -----------------------------------------------------------
+# 1. Skeleton SHD vs sample size for different alpha
+# -----------------------------------------------------------
+
+insurance_alpha_pc <- ggplot(alpha_sensitivity_pc_insurance$summary, 
+       aes(x = sample_size, 
+           y = mean_skeleton_shd, 
+           colour = factor(alpha))) +
+  geom_line() +
+  geom_point(size = 1) +
+  labs(
+    x = "Sample Size",
+    y = "Skeleton SHD",
+    colour = expression(alpha),
+    title = "PC-Stable Algorithm"
+  ) +
+  scale_y_continuous(limits = c(20, 45)) +
+  theme_minimal()
+
+
+insurance_alpha_mmhc <- ggplot(alpha_sensitivity_mmhc_insurance$summary, 
+       aes(x = sample_size, 
+           y = mean_skeleton_shd, 
+           colour = factor(alpha))) +
+  geom_line() +
+  geom_point(size = 1) +
+  labs(
+    x = "Sample Size",
+    y = "Skeleton SHD",
+    colour = expression(alpha),
+    title = "MMHC Algorithm"
+  ) +
+  scale_y_continuous(limits = c(20, 45)) +
+  theme_minimal()
+
+
+insurance_alpha_combined <- insurance_alpha_pc + plot_spacer() + insurance_alpha_mmhc +
+  plot_layout(widths = c(1, 0.1, 1), guides = "collect") & 
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title.x = element_text(margin = margin(t = 10))
+  )
+
+insurance_alpha_combined
+
+
+# -----------------------------------------------------------
+# 2. Normalised SHD vs sample size for different alpha
+# -----------------------------------------------------------
+
+insurance_alpha_pc_norm <- ggplot(alpha_sensitivity_pc_water$summary, 
+       aes(x = sample_size, 
+           y = mean_norm_shd, 
+           colour = factor(alpha))) +
+  geom_line() +
+  geom_point(size = 1) +
+  labs(
+    x = "Sample Size",
+    y = "Skeleton SHD",
+    colour = expression(alpha),
+    title = "PC-Stable Algorithm"
+  ) +
+  theme_minimal()
+
+
+insurance_alpha_mmhc_norm <- ggplot(alpha_sensitivity_mmhc_water$summary, 
+       aes(x = sample_size, 
+           y = mean_norm_shd, 
+           colour = factor(alpha))) +
+  geom_line() +
+  geom_point(size = 1) +
+  labs(
+    x = "Sample Size",
+    y = "Skeleton SHD",
+    colour = expression(alpha),
+    title = "MMHC Algorithm"
+  ) +
+  theme_minimal()
+
+
+insurance_alpha_combined_norm <- insurance_alpha_pc_norm + plot_spacer() + insurance_alpha_mmhc_norm +
+  plot_layout(widths = c(1, 0.1, 1), guides = "collect") & 
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title.x = element_text(margin = margin(t = 10))
+  )
+
+insurance_alpha_combined_norm
+```
+
+```{r}
+# Combine data into one dataframe
+
+alpha_sensitivity_combined <- bind_rows(
+  
+  alpha_sensitivity_pc_insurance$summary %>%
+    mutate(Network = "Insurance", Algorithm = "PC-Stable"),
+  
+  alpha_sensitivity_mmhc_insurance$summary %>%
+    mutate(Network = "Insurance", Algorithm = "MMHC"),
+  
+  alpha_sensitivity_pc_alarm$summary %>%
+    mutate(Network = "Alarm", Algorithm = "PC-Stable"),
+  
+  alpha_sensitivity_mmhc_alarm$summary %>%
+    mutate(Network = "Alarm", Algorithm = "MMHC"),
+  
+  alpha_sensitivity_pc_water$summary %>%
+    mutate(Network = "Water", Algorithm = "PC-Stable"),
+  
+  alpha_sensitivity_mmhc_water$summary %>%
+    mutate(Network = "Water", Algorithm = "MMHC"),
+  
+  alpha_sensitivity_pc_andes$summary %>%
+    mutate(Network = "Andes", Algorithm = "PC-Stable"),
+  
+  alpha_sensitivity_mmhc_andes$summary %>%
+    mutate(Network = "Andes", Algorithm = "MMHC")
+)
+
+alpha_sensitivity_combined$Algorithm <- factor(
+  alpha_sensitivity_combined$Algorithm,
+  levels = c("PC-Stable", "MMHC")
+)
+
+alpha_sensitivity_plot <- ggplot(
+  alpha_sensitivity_combined,
+  aes(
+    x = sample_size,
+    y = mean_norm_shd,
+    color = factor(alpha),
+    group = alpha
+  )
+) +
+  geom_line(size = 0.8) +
+  geom_point(size = 1) +
+  facet_grid(
+    rows = vars(Network),
+    cols = vars(Algorithm),
+    switch = "y",
+    scales = "free_y"
+  ) +
+  #scale_y_continuous(limits = c(0.25, 0.86)) +
+  labs(
+    x = "Sample Size",
+    y = "Mean Normalised SHD",
+    color = expression(alpha)
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.placement = "outside",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    #aspect.ratio = 1
+  )
+
+alpha_sensitivity_plot
+
+ggsave("Alpha_Sensitivity.png", alpha_sensitivity_plot, width = 7, height = 4.8)
+```
+
+# 2. Objective function sensitivity
+
+
+```{r}
+# Combining data in one dataframe for plotting
+
+objective_sensitivity_combined <- bind_rows(
+  objective_sensitivity_hc_insurance$summary %>%
+    mutate(Network = "Insurance", Algorithm = "Hill-Climbing"),
+
+  objective_sensitivity_mmhc_insurance$summary %>%
+    mutate(Network = "Insurance", Algorithm = "MMHC"),
+
+  objective_sensitivity_hc_alarm$summary %>%
+    mutate(Network = "Alarm", Algorithm = "Hill-Climbing"),
+
+  objective_sensitivity_mmhc_alarm$summary %>%
+    mutate(Network = "Alarm", Algorithm = "MMHC"),
+
+  objective_sensitivity_hc_water$summary %>%
+    mutate(Network = "Water", Algorithm = "Hill-Climbing"),
+
+  objective_sensitivity_mmhc_water$summary %>%
+    mutate(Network = "Water", Algorithm = "MMHC"),
+  
+  objective_sensitivity_hc_andes$summary %>%
+    mutate(Network = "Andes", Algorithm = "Hill-Climbing"),
+
+  objective_sensitivity_mmhc_andes$summary %>%
+    mutate(Network = "Andes", Algorithm = "MMHC")
+)
+
+# Plotting mean skeleton SHD
+
+ggplot(
+  objective_sensitivity_combined,
+  aes(
+    x = sample_size,
+    y = mean_skeleton_shd,
+    color = score,
+    linetype = score
+  )
+) +
+  geom_line(size = 0.8) +
+  facet_grid(
+    rows = vars(Network),
+    cols = vars(Algorithm),
+    switch = "y"
+  ) +
+  labs(
+    x = "Sample Size",
+    y = "Mean Skeleton SHD",
+    color = "Score",
+    linetype = "Score"
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.placement = "outside",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+# Plotting normalised SHD
+
+objective_function_plot <- ggplot(
+  objective_sensitivity_combined,
+  aes(
+    x = sample_size,
+    y = mean_norm_shd,
+    color = score,
+    linetype = score
+  )
+) +
+  geom_line(size = 0.8) +
+  facet_grid(
+    rows = vars(Network),
+    cols = vars(Algorithm),
+    switch = "y"
+  ) +
+  labs(
+    x = "Sample Size",
+    y = "Mean Normalised SHD",
+    color = "Score",
+    linetype = "Score"
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.placement = "outside",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+objective_function_plot
+
+ggsave("objective_function_sensitivity.png", objective_function_plot, width = 7, height = 4.8)
+```
+
+# 3. Objective function sensitivity using precision and recall
+
+```{r}
+precision_recall_combined <- bind_rows(
+  
+  objective_sensitivity_hc_insurance$raw_results %>%
+    filter(sample_size == 5000) %>%
+    mutate(Network = "Insurance", Algorithm = "Hill-Climbing"),
+  
+  objective_sensitivity_mmhc_insurance$raw_results %>%
+    filter(sample_size == 5000) %>%
+    mutate(Network = "Insurance", Algorithm = "MMHC"),
+  
+  objective_sensitivity_hc_alarm$raw_results %>%
+    filter(sample_size == 5000) %>%
+    mutate(Network = "Alarm", Algorithm = "Hill-Climbing"),
+  
+  objective_sensitivity_mmhc_alarm$raw_results %>%
+    filter(sample_size == 5000) %>%
+    mutate(Network = "Alarm", Algorithm = "MMHC"),
+  
+  objective_sensitivity_hc_water$raw_results %>%
+    filter(sample_size == 5000) %>%
+    mutate(Network = "Water", Algorithm = "Hill-Climbing"),
+  
+  objective_sensitivity_mmhc_water$raw_results %>%
+    filter(sample_size == 5000) %>%
+    mutate(Network = "Water", Algorithm = "MMHC"),
+
+  objective_sensitivity_hc_andes$raw_results %>%
+    filter(sample_size == 5000) %>%
+    mutate(Network = "Andes", Algorithm = "Hill-Climbing"),
+    
+  objective_sensitivity_mmhc_andes$raw_results %>%
+    filter(sample_size == 5000) %>%
+    mutate(Network = "Andes", Algorithm = "MMHC")
+)
+
+precision_recall_objective_plot <- ggplot(
+  precision_recall_combined,
+  aes(
+    x = recall,
+    y = precision,
+    color = score
+  )
+) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  geom_jitter(width = 0.005, height = 0.005, alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, linetype = 3) +
+  facet_grid(
+    rows = vars(Network),
+    cols = vars(Algorithm),
+    switch = "y"
+  ) +
+  coord_cartesian(xlim = c(0.2, 1),
+                  ylim = c(0.2, 1.05)) +
+  labs(
+    x = "Recall",
+    y = "Precision",
+    color = "Objective Function"
+  ) +
+  #theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    strip.placement = "outside",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold")
+    #aspect.ratio = 1
+  )
+
+precision_recall_objective_plot
+
+ggsave("AIC_BIC_Precision_Recall.png", precision_recall_objective_plot, width = 7, height = 4.8)
+```
+
+## Structural error decompositions
+
+```{r}
+base_theme <- theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(size = 11)
+  )
+
+dodge <- position_dodge(width = 0.3)
+
+p_full <- ggplot(structural_decomp_df, aes(x = network, y = mean_norm_full_shd,
+                                colour = algorithm, group = algorithm)) +
+  geom_line(position = dodge, linewidth = 0.9) +
+  geom_point(position = dodge, size = 2.8) +
+  geom_errorbar(aes(ymin = mean_norm_full_shd - sd_shd,
+                    ymax = mean_norm_full_shd + sd_shd),
+                width = 0.08, position = dodge, linewidth = 0.6) +
+  labs(
+    x = "Network",
+    y = "Normalised SHD",
+    title = "Normalised Structural Hamming Distance",
+    color = "Algorithm"
+  ) +
+  scale_colour_manual(values = c("HC"="#1b9e77","PC"="#d95f02","MMHC"="#7570b3")) +
+  base_theme +
+  theme(
+    legend.position = "bottom",
+    legend.justification = "center",
+    legend.key.width = unit(1.5, "cm"),
+    legend.spacing.x = unit(0.5, "cm"),
+    plot.title = element_text(size = 11)
+  )
+
+p_skeleton <- ggplot(structural_decomp_df, aes(x = network, y = mean_norm_skeleton_shd,
+                                    colour = algorithm, group = algorithm)) +
+  geom_line(position = dodge, linewidth = 0.9) +
+  geom_point(position = dodge, size = 2.8) +
+  geom_errorbar(aes(ymin = mean_norm_skeleton_shd - sd_skeleton_shd,
+                    ymax = mean_norm_skeleton_shd + sd_skeleton_shd),
+                width = 0.08, position = dodge, linewidth = 0.6) +
+  labs(
+    x = "Network",
+    y = "Normalised Skeleton SHD",
+    color = "Algorithm"
+  ) +
+  scale_colour_manual(values = c("HC"="#1b9e77","PC"="#d95f02","MMHC"="#7570b3")) +
+  base_theme +
+  theme(legend.position = "none")
+
+p_orientation <- ggplot(structural_decomp_df, aes(x = network, y = mean_norm_orientation_shd,
+                                        colour = algorithm, group = algorithm)) +
+  geom_line(position = dodge, linewidth = 0.9) +
+  geom_point(position = dodge, size = 2.8) +
+  geom_errorbar(aes(ymin = mean_norm_orientation_shd - sd_orientation_shd,
+                    ymax = mean_norm_orientation_shd + sd_orientation_shd),
+                width = 0.08, position = dodge, linewidth = 0.6) +
+  labs(
+    x = "Network",
+    y = "Normalised Orientation SHD",
+    color = "Algorithm"
+  ) +
+  scale_colour_manual(values = c("HC"="#1b9e77","PC"="#d95f02","MMHC"="#7570b3")) +
+  base_theme +
+  theme(legend.position = "none")
+
+p_decomp <- p_skeleton + p_orientation +
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    title = "Decomposition of Structural Errors",
+    subtitle = "Skeleton vs Orientation Components"
+  )
+
+p_combined <- (p_skeleton + p_orientation) +
+  plot_layout(guides = "collect") &
+  plot_annotation(
+    title = "Decomposition of Structural Errors"
+  ) &
+  theme(
+    legend.position = "bottom",
+    legend.justification = "center",
+    legend.key.width = unit(1.5, "cm"),
+    legend.spacing.x = unit(0.5, "cm"),
+    plot.title = element_text(size = 11)
+  )
+
+p_combined
+p_full
+```
+

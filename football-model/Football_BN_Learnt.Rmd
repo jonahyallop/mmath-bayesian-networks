@@ -1,0 +1,639 @@
+---
+title: "Football_BN_Data_Learned"
+author: "Jonah Yallop"
+date: "2025-11-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+library(bnlearn)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(purrr)
+library(gRain)
+library(igraph)
+library(verification)
+library(zoo)
+library(data.table)
+```
+
+
+```{r}
+# Load in all matches since 1993/94 to build up conditional probability table
+historical_matches <- read.csv("Data/historical_matches_elo.csv")
+
+# Load in 25/26 fixtures for prediction
+fixtures_2526 <- read.csv("Data/2025_26_fixtures.csv")
+fixtures_2526['season'] <- "2025/26"
+
+# Tables from 1993/94 - 2023/24
+season_tables <- read.csv("Data/epl_tables.csv")
+
+season_tables <- season_tables %>%
+  rename(season = season_end_year)
+
+# Current premier league table
+current_table <- read.csv("Data/current_table.csv")
+
+# Load in ELO ratings
+elo_ratings <- read.csv("Data/elo_ratings.csv")
+```
+
+# 1. Building the learning dataset
+
+```{r}
+full_data <- historical_matches[! is.na(historical_matches$home_elo),]
+# Convert all character columns to factor
+for (col in names(full_data)) {
+  if (is.character(full_data[[col]])) {
+    full_data[[col]] <- as.factor(full_data[[col]])
+  }
+}
+
+full_data$home_elo_bin <- 
+  cut(full_data$home_elo,
+      breaks = quantile(
+        full_data$home_elo,
+        probs = c(0, .25, .5, .75, 1), na.rm=TRUE
+      ),
+      include.lowest = TRUE,
+      labels = c("rating1","rating2","rating3", "rating4"))
+
+full_data$away_elo_bin <- 
+  cut(full_data$away_elo,
+      breaks = quantile(
+        full_data$away_elo,
+        probs = c(0, .25, .5, .75, 1), na.rm=TRUE
+      ),
+      include.lowest = TRUE,
+      labels = c("rating1","rating2","rating3", "rating4"))
+```
+
+# 1.1 Adding in all variables included in the expert model - goal difference and expected points
+
+```{r}
+add_projected_variables_all_seasons <- function(results_all,
+                                                season_points,
+                                                compute_component1_mean,
+                                                matches_per_gameweek = 10) {
+  
+  all_seasons <- sort(unique(results_all$season))
+  
+  results_augmented_list <- lapply(all_seasons, function(season_i) {
+    
+    cat("Processing season:", season_i, "\n")
+    
+    # Filter matches for this season only
+    res_season <- results_all %>% filter(season == season_i)
+    
+    # Build standings for this season
+    standings_season <- build_standings_by_gw(
+      res_season,
+      matches_per_gameweek = matches_per_gameweek
+    )
+    
+    # Add expected points / projected GD for this season
+    standings_with_exp <- add_exp_points_to_standings(
+      results = res_season,
+      standings_by_gw = standings_season,
+      season_points = season_points,
+      compute_component1_mean = compute_component1_mean,
+      cur_season = season_i,
+      matches_per_gameweek = matches_per_gameweek
+    )
+    
+    # Calculate projected goal difference
+    standings_with_exp$projected_goal_difference <- 
+      standings_with_exp$goal_difference / 
+      standings_with_exp$gameweek * 38
+    
+    # Rounding
+    standings_with_exp <- standings_with_exp %>% 
+      mutate(across("projected_goal_difference", round, 0))
+    
+    colnames(standings_with_exp)[colnames(standings_with_exp) == 'Mean'] <- 'current_exp_points'
+    
+    # Discretising current expected points
+    standings_with_exp$current_exp_points_bin <- 
+      cut(standings_with_exp$current_exp_points,
+          breaks = quantile(
+            standings_with_exp$current_exp_points,
+            probs = c(0, .33, .66, 1), na.rm=TRUE
+          ),
+          include.lowest = TRUE,
+          labels = c("Low","Med","High"))
+        
+    goaldiff_breaks <- c(-Inf, -30, -20, -10, 0, 10, 20, 30, Inf)  
+    goaldiff_labels <- NULL
+    
+    n_gd_intervals <- length(goaldiff_breaks) - 1
+    if (is.null(goaldiff_labels)) {
+      lefts  <- head(goaldiff_breaks, -1)
+      rights <- tail(goaldiff_breaks, -1)
+      goaldiff_labels <- vapply(seq_len(n_gd_intervals),
+                                function(i) paste0("(", lefts[i], ",", rights[i], "]"),
+                                character(1), USE.NAMES = FALSE)
+    } else {
+      if (length(goaldiff_labels) != n_gd_intervals) {
+        stop("goaldiff_labels length must equal number of intervals (length(goaldiff_breaks)-1).")
+      }
+    }
+    
+    standings_with_exp$goal_difference_bin <- cut(standings_with_exp$projected_goal_difference,
+                                  breaks = goaldiff_breaks,
+                                  labels = goaldiff_labels,
+                                  include.lowest = TRUE)
+    
+    # Shift to get pre-game values
+    standings_with_exp_pre <- standings_with_exp %>%
+      mutate(gameweek = gameweek + 1)
+    
+    
+    # Merge back onto match dataset
+    res_season_aug <- res_season %>%
+      left_join(
+        standings_with_exp_pre %>%
+          dplyr::select(gameweek, team, goal_difference_bin, current_exp_points_bin) %>%
+          rename(
+            home_team = team,
+            home_goal_difference_bin = goal_difference_bin,
+            home_current_exp_points_bin = current_exp_points_bin
+          ),
+        by = c("home_team", "gameweek")
+      ) %>%
+      left_join(
+        standings_with_exp_pre %>%
+          dplyr::select(gameweek, team, goal_difference_bin, current_exp_points_bin) %>%
+          rename(
+            away_team = team,
+            away_goal_difference_bin = goal_difference_bin,
+            away_current_exp_points_bin = current_exp_points_bin
+          ),
+        by = c("away_team", "gameweek")
+      )
+    
+    return(res_season_aug)
+  })
+  
+  bind_rows(results_augmented_list)
+}
+```
+
+```{r}
+full_data <- full_data %>%
+  group_by(season) %>%
+  mutate(
+    row_in_season = row_number(),
+    gameweek = ceiling(row_in_season / 10)
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-row_in_season)
+```
+
+```{r, warning=FALSE}
+results_with_proj <- add_projected_variables_all_seasons(
+  results_all = full_data,
+  season_points = season_tables,
+  compute_component1_mean = compute_component1_mean
+)
+```
+
+
+```{r}
+results_with_proj <- subset(results_with_proj, select = -c(match_id, home_goals, away_goals, season, home_elo, away_elo))
+results_with_proj_home <- subset(results_with_proj, select = -c(home_team, away_team, away_elo_bin, away_goal_difference_bin, away_current_exp_points_bin,
+                                                                date, gameweek))
+
+results_with_proj_home <- results_with_proj_home %>%
+    mutate(home_goal_difference_bin = if_else(is.na(home_goal_difference_bin), "(0,10]", home_goal_difference_bin))
+results_with_proj_home <- results_with_proj_home %>%
+    mutate(home_current_exp_points_bin = if_else(is.na(home_current_exp_points_bin), "Med", home_current_exp_points_bin))
+
+results_with_proj_home[["home_goal_difference_bin"]] <- as.factor(results_with_proj_home[["home_goal_difference_bin"]])
+results_with_proj_home[["home_current_exp_points_bin"]] <- as.factor(results_with_proj_home[["home_current_exp_points_bin"]])
+
+# Drop unused factor levels
+results_with_proj_home$result <- droplevels(results_with_proj_home$result)
+
+# Make sure all predictors are factors too
+factor_cols <- c("home_elo_bin","home_goal_difference_bin","home_current_exp_points_bin")
+results_with_proj_home[factor_cols] <- lapply(results_with_proj_home[factor_cols], factor)
+
+results_with_proj_home[] <- lapply(results_with_proj_home, function(x) {
+  if(is.factor(x)) {
+    levels(x) <- make.names(levels(x), unique = TRUE)
+  }
+  x
+})
+```
+
+```{r}
+# Tidying
+
+results_with_proj$home_goal_difference_bin <- replace(results_with_proj$home_goal_difference_bin, is.na(results_with_proj$home_goal_difference_bin),"(0,10]")
+results_with_proj$away_goal_difference_bin <- replace(results_with_proj$away_goal_difference_bin, is.na(results_with_proj$away_goal_difference_bin),"(0,10]")
+results_with_proj$home_current_exp_points_bin <- replace(results_with_proj$home_current_exp_points_bin, is.na(results_with_proj$home_current_exp_points_bin),"Med")
+results_with_proj$away_current_exp_points_bin <- replace(results_with_proj$away_current_exp_points_bin, is.na(results_with_proj$away_current_exp_points_bin),"Med")
+
+df_bn <- results_with_proj %>%
+  dplyr::select(home_goal_difference_bin, away_goal_difference_bin, home_current_exp_points_bin, away_current_exp_points_bin, result, home_elo_bin, away_elo_bin)
+
+df_bn <- as.data.frame(df_bn)
+```
+
+```{r}
+# Function to learn structure using MMHC
+
+run_mmhc <- function(data,
+                     ci.test = "mi",
+                     alpha = 0.05,
+                     score = "bic",
+                     restart = 0,
+                     blacklist = blacklist,
+                     inc_blacklist = FALSE) {
+
+  if (inc_blacklist) {
+    bn.mmhc <- bnlearn::mmhc(
+      x = data,
+      restrict.args = list(test = ci.test, alpha = alpha),
+      maximize.args = list(score = score, restart = restart),
+      blacklist = blacklist
+    )
+  }
+  else {
+    bn.mmhc <- bnlearn::mmhc(
+      x = data,
+      restrict.args = list(test = ci.test, alpha = alpha),
+      maximize.args = list(score = score, restart = restart)
+    )
+  }
+
+  list(
+    model = bn.mmhc,
+    arcs = bnlearn::arcs(bn.mmhc),
+    score = bnlearn::score(bn.mmhc, data)
+  )
+}
+
+# Define edges not allowed
+blacklist <- data.frame(
+  from = "result",
+  to = c("away_goal_difference_bin","away_current_exp_points_bin")
+)
+
+mmhc_run <- run_mmhc(df_bn, ci.test = "mi", alpha = 0.05, inc_blacklist = TRUE, blacklist = blacklist)
+
+mmhc_score = mmhc_run$score
+mmhc_model = mmhc_run$model
+
+mmhc_fit <- bn.fit(mmhc_model, data = df_bn, method = "bayes")
+```
+
+```{r}
+# Reversing some arcs that are markov equivalent
+
+mmhc_model_reversed <- reverse.arc(mmhc_model, from = "home_current_exp_points_bin", to = "home_elo_bin")
+mmhc_model_reversed <- reverse.arc(mmhc_model_reversed, from = "away_current_exp_points_bin", to = "away_elo_bin")
+mmhc_model_reversed <- reverse.arc(mmhc_model_reversed, from = "away_goal_difference_bin", to = "away_current_exp_points_bin")
+mmhc_model_reversed <- reverse.arc(mmhc_model_reversed, from = "home_goal_difference_bin", to = "home_current_exp_points_bin")
+
+mmhc_reversed_fit <- bn.fit(mmhc_model_reversed, data = df_bn, method = "bayes")
+```
+
+```{r}
+# Plotting DAG and CPDAG of the learnt model
+cp <- cpdag(mmhc_model)
+graphviz.plot(cp)
+graphviz.plot(mmhc_model)
+graphviz.plot(mmhc_model_reversed)
+```
+
+# Learning with bootstrapping
+
+```{r}
+# Get strength and direction values
+boot <- boot.strength(
+  df_bn,
+  R = 500,
+  algorithm = "mmhc",
+  algorithm.args = list(
+    blacklist = blacklist
+  )
+)
+```
+
+## Generating predictions from the learnt model
+
+```{r}
+predict_match_learned <- function(fitted_bn, evidence, n = 20000) {
+
+  p_H <- cpquery(
+    fitted_bn,
+    event = (result == "H"),
+    evidence = evidence,
+    method = "lw",
+    n = n
+  )
+
+  p_D <- cpquery(
+    fitted_bn,
+    event = (result == "D"),
+    evidence = evidence,
+    method = "lw",
+    n = n
+  )
+
+  p_A <- cpquery(
+    fitted_bn,
+    event = (result == "A"),
+    evidence = evidence,
+    method = "lw",
+    n = n
+  )
+
+  probs <- c(p_H = p_H, p_D = p_D, p_A = p_A)
+  probs / sum(probs)
+}
+
+build_evidence_learned <- function(row, fitted_bn) {
+
+  nodes <- names(fitted_bn)
+  nodes <- setdiff(nodes, "result")
+
+  ev <- lapply(nodes, function(v) as.character(row[[v]]))
+  names(ev) <- nodes
+  ev
+}
+
+predict_fixtures_learned <- function(fixtures_df, fitted_bn, n = 20000) {
+
+  preds <- t(sapply(seq_len(nrow(fixtures_df)), function(i) {
+
+    row <- fixtures_df[i, , drop = FALSE]
+
+    evidence <- build_evidence_learned(row, fitted_bn)
+
+    predict_match_learned(fitted_bn, evidence, n = n)
+  }))
+
+  cbind(fixtures_df, as.data.frame(preds))
+}
+```
+
+```{r}
+get_learnt_predictions_for_full_season <- function(
+    season_int, historical_matches, season_tables, fitted_bn, results2526, current_gw) {
+    
+  matches_per_gameweek <- 10
+
+  if (season_int == 2025) {
+    season_results <- results2526 %>%
+      rename(match_id = match_number) %>%
+      filter(gameweek <= current_gw)
+    season_results$season <- 2025
+  } else {
+  
+    season_results <- historical_matches[historical_matches$season == season_int, ]
+    season_results$match_id <- season_results$match_id - min(season_results$match_id) + 1
+    
+    season_results <- season_results %>%
+    mutate(
+      match_id = .[["match_id"]],
+      gameweek = ceiling(as.numeric(match_id) / matches_per_gameweek)
+    )
+  }
+  
+  standings_by_gameweek <- build_standings_by_gw(season_results, matches_per_gameweek = matches_per_gameweek)
+  
+  standings_with_expected_points <- add_exp_points_to_standings(
+    results = season_results,
+    standings_by_gw = standings_by_gameweek,
+    season_points = season_tables,
+    compute_component1_mean = compute_component1_mean,
+    cur_season = season_int + 1,
+    matches_per_gameweek = matches_per_gameweek
+  )
+  
+  # Calculate projected goal difference
+  standings_with_expected_points$projected_goal_difference <- 
+    standings_with_expected_points$goal_difference / 
+    standings_with_expected_points$gameweek * 38
+  
+  # Rounding
+  standings_with_expected_points <- standings_with_expected_points %>% 
+    mutate(across("projected_goal_difference", round, 0))
+  
+  names(standings_with_expected_points)[names(standings_with_expected_points) == 'Mean'] <- 'current_exp_points'
+  names(standings_with_expected_points)[names(standings_with_expected_points) == 'elo'] <- 'rating'
+  
+  standings_with_expected_points <- discretise_features(
+    df = standings_with_expected_points
+  )
+  
+  standings_with_expected_points$current_exp_points_bin <- 
+    cut(standings_with_expected_points$current_exp_points,
+        breaks = quantile(
+          standings_with_expected_points$current_exp_points,
+          probs = c(0, .33, .66, 1), na.rm=TRUE
+        ),
+        include.lowest = TRUE,
+        labels = c("Low","Med","High"))
+  
+  # Merging on the node columns (expected points, goal difference, ELO) with fixtures
+  # Merge on current points, goal difference and elo
+  season_results <- season_results %>%
+    left_join(
+      standings_with_expected_points %>%
+        dplyr::select("gameweek", "team", "goal_difference_bin", "elo_bin", "current_exp_points_bin") %>%
+        rename(
+          home_team                   = team,
+          home_goal_difference_bin    = goal_difference_bin,
+          home_elo_bin                = elo_bin,
+          home_current_exp_points_bin = current_exp_points_bin
+        ),
+      by = c("home_team", "gameweek")
+    ) %>%
+    left_join(
+      standings_with_expected_points %>%
+        dplyr::select("gameweek", "team", "goal_difference_bin", "elo_bin", "current_exp_points_bin") %>%
+        rename(
+          away_team                   = team,
+          away_goal_difference_bin    = goal_difference_bin,
+          away_elo_bin                = elo_bin,
+          away_current_exp_points_bin = current_exp_points_bin
+        ),
+      by = c("away_team", "gameweek")
+    )
+  
+    # Generate predictions
+    predictions <- predict_fixtures_learned(
+      fixtures_df = season_results,
+      fitted_bn = fitted_bn
+    )
+    
+    return(predictions)
+}
+```
+
+```{r}
+learnt_current_predictions <- predict_fixtures_learned(current_fixtures, mmhc_reversed_fit)
+
+learnt_all_predictions <- list()
+
+for (season_int in (2000:2024)){
+  message(glue("Generating predictions for season {season_int}/{season_int + 1}"))
+  
+  learnt_all_predictions[[as.character(season_int)]] <- 
+    get_learnt_predictions_for_full_season(
+      season_int = season_int,
+      historical_matches = historical_matches,
+      season_tables = season_tables,
+      fitted_bn = mmhc_reversed_fit,
+      results2526 = results_2526,
+      current_gw = 28
+    )
+}
+```
+
+```{r}
+for (season_int in (2000:2024)){
+  
+  learnt_all_predictions[[as.character(season_int)]]$predicted_outcome <- 
+    c("H","D","A")[max.col(learnt_all_predictions[[as.character(season_int)]][, c("p_H","p_D","p_A")])]
+  
+  learnt_all_predictions[[as.character(season_int)]]$correct_prediction <-
+    learnt_all_predictions[[as.character(season_int)]]$result == learnt_all_predictions[[as.character(season_int)]]$predicted_outcome  
+  
+  all_predictions[[as.character(season_int)]]$predicted_outcome <- 
+    c("H","D","A")[max.col(all_predictions[[as.character(season_int)]][, c("p_H","p_D","p_A")])]
+  
+  all_predictions[[as.character(season_int)]]$correct_prediction <-
+    all_predictions[[as.character(season_int)]]$result == all_predictions[[as.character(season_int)]]$predicted_outcome  
+}
+```
+
+
+```{r}
+# Generating RPS values for each season
+
+pmat_list_SL <- list()
+obs_vec_list_SL <- list()
+rps_values_list_SL <- list()
+
+for (season_int in 2000:2024){
+  
+  pmat_list_SL[[as.character(season_int)]] <- as.matrix(
+    learnt_all_predictions[[as.character(season_int)]][, c("p_H", "p_D", "p_A")]
+  )
+  
+  obs_vec_list_SL[[as.character(season_int)]] <- match(
+    learnt_all_predictions[[as.character(season_int)]]$result, c("H", "D", "A")
+  )
+  
+  rps_values_list_SL[[as.character(season_int)]] <- rps(
+    obs = obs_vec_list_SL[[as.character(season_int)]], pred = pmat_list_SL[[as.character(season_int)]]
+  )$rps
+
+}
+
+# Converting into dataframe
+rps_values_SL <- data.frame(
+  season = names(rps_values_list_SL),
+  rps     = unlist(rps_values_list_SL)
+)
+
+# Adding reference row for pi football value
+rps_values_SL[nrow(rps_values_SL) + 1,] = c("2010_pifootball", rps_values_pifoot1011$rps)
+rps_values_SL[nrow(rps_values_SL) + 1,] = c("2011_pifootball", rps_values_pifoot1112$rps)
+```
+
+## Comparing learnt vs expert models
+
+```{r}
+rps_comparison <- rps_values %>%
+      left_join(
+        rps_values_SL %>%
+          rename(
+            rps_SL = rps
+          ),
+        by = c("season")
+      )
+
+rps_comparison$diff <- (as.numeric(rps_comparison$rps_SL) - as.numeric(rps_comparison$rps))
+
+rps_comparison$rps <- as.numeric(rps_comparison$rps)
+rps_comparison$rps_SL <- as.numeric(rps_comparison$rps_SL)
+
+mean_SL_rps <- mean(as.numeric(rps_comparison$rps_SL))
+mean_rps <- mean(as.numeric(rps_comparison$rps))
+
+mean_rps; mean_SL_rps
+```
+
+```{r}
+rps_long <- rps_comparison |>
+  pivot_longer(
+    cols = c(rps, rps_SL),
+    names_to = "model",
+    values_to = "rps"
+  )
+
+rps_long$rps <- as.numeric(rps_long$rps)
+```
+
+
+## Plotting comparisons
+
+```{r}
+rps_comparison_plot <- ggplot(head(rps_long, 50), 
+       aes(x = season, y = rps, color = model, group = model)) +
+  geom_line() +
+  geom_point() +
+
+  geom_hline(data = means_df,
+             aes(yintercept = mean_rps, color = model),
+             linetype = "dashed") +
+  
+  geom_point(
+    data = data.frame(
+      season = c("2010", "2011"),
+      rps = c(
+        rps_long[rps_long$season == "2010_pifootball",]$rps[1],
+        rps_long[rps_long$season == "2011_pifootball",]$rps[1]
+      ),
+      model = "Pi Football"
+    ),
+    aes(x = season, y = rps, color = model),
+    size = 2
+  ) +
+
+  labs(
+    title = "RPS Values for Expert and Learned Models",
+    x = "Season Start Year",
+    y = "RPS"
+  ) +
+  scale_color_manual(
+    values = c(
+      "rps" = "#F8766D",  
+      "rps_SL" = "#00BFC4",     
+      "Pi Football" = "black"
+    ),
+    labels = c(
+      "rps" = "Expert Model",
+      "rps_SL" = "Learnt Model",
+      "Pi Football" = "Pi Football"
+    )
+  ) +
+  labs(colour = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+rps_comparison_plot
+```

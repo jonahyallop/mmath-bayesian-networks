@@ -1,0 +1,2084 @@
+---
+title: "Football_BN_v4"
+author: "Jonah Yallop"
+date: "2025-11-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Load required packages
+
+```{r, include=FALSE}
+library(bnlearn)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(purrr)
+library(gRain)
+library(igraph)
+library(verification)
+library(zoo)
+library(data.table)
+library(glue)
+```
+
+# 2. Load required data
+- Historical match results from 1993
+-- Used to build up the CPT for rank -> match result
+- Current season fixtures
+-- Used for predictions
+- Sesaon end tables since 1993
+-- Used for historical rank calculation
+- Current table
+-- Used to get current expected points and projected goal difference
+- ELO ratings
+-- Used for fitting the CPT
+
+# 2.1. Read in raw data
+
+```{r}
+# Load in all matches since 1993/94 to build up conditional probability table
+historical_matches <- read.csv("Data/matches_processed.csv")
+
+# Load in 25/26 fixtures for prediction
+fixtures_2526 <- read.csv("Data/2025_26_fixtures.csv")
+
+# Load in 25/26 results for prediction
+results_2526 <- read.csv("Data/2025_26_results.csv")
+
+# Load in tables from 1993/94 - 2023/24
+season_tables <- read.csv("Data/epl_tables.csv")
+
+# Current premier league table
+current_table_gw7 <- read.csv("Data/current_table.csv")
+current_table_gw26 <- read.csv("Data/current_table_gw26.csv")
+
+current_table <- current_table_gw7
+
+# Load in current ELO ratings
+elo_ratings <- read.csv("Data/elo_ratings.csv")
+
+# Load in historical ELO ratings
+historical_elo <- read.csv("Data/historical_elo.csv")
+```
+
+# 2.2. Initial data processing
+
+```{r, warning=FALSE}
+# Add season column to current fixtures
+fixtures_2526['season'] <- "2025/26"
+
+season_tables <- season_tables %>%
+  rename(season = season_end_year) %>%
+  mutate(season = season - 1)
+
+# Filter for seasons since 2000 - due to ELO availability
+season_tables <- season_tables[season_tables$season >= 2000,]
+
+season_tables <- subset(season_tables, select = - c(X))
+
+# Convert season column to year integer
+historical_matches <- historical_matches %>%
+  mutate(season = str_sub(season, 1, -4)) %>%
+  mutate(season = as.integer(season))
+
+# Filter for matches since 2000 - due to ELO availability
+historical_matches <- historical_matches[historical_matches$season >= 2000,]
+
+names(historical_elo)[names(historical_elo) == 'date'] <- 'elo_date'
+
+# ----------------------------------------------
+# Merging start of season ELO values onto tables
+# ----------------------------------------------
+
+# Add date column for merge
+season_tables <- season_tables %>%
+  mutate(elo_date = paste0("01/08/", season))
+
+# Merge on ELO for each team at the start of the season
+season_tables <- season_tables %>%
+  left_join(historical_elo %>% dplyr::select(team, elo_date, elo),
+            by = c("elo_date", "team"))
+
+season_tables <- season_tables[!is.na(season_tables$elo),]
+
+# -----------------------------
+# Merging ELO onto each fixture
+# -----------------------------
+
+names(historical_elo)[names(historical_elo) == 'elo_date'] <- 'date'
+
+historical_elo <- historical_elo[historical_elo$country == "ENG",]
+
+# Convert dates
+setDT(historical_matches)
+setDT(historical_elo)
+
+historical_matches[, date := as.IDate(strptime(date, "%d/%m/%Y"))]
+historical_elo[, date := as.IDate(strptime(date, "%d/%m/%Y"))]
+
+# Set key on ELO table
+setorder(historical_elo, team, date)
+setkey(historical_elo, team, date)
+
+# ------------------------------------
+# Assign ELO onto matches (home teams)
+# ------------------------------------
+
+historical_matches[, home_elo := historical_elo[.SD, on = .(team = home_team, date), elo, roll = TRUE]]
+
+# Compute first ELO date per team and force NA for earlier matches
+min_elo_by_team <- historical_elo[, .(min_elo_home = min(date)), by = team]
+
+# Merge min ELO on
+historical_matches <- merge(
+  historical_matches,
+  min_elo_by_team,
+  by.x = "home_team",
+  by.y = "team",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+# ------------------------------------
+# Assign ELO onto matches (away teams)
+# ------------------------------------
+
+historical_matches[, away_elo := historical_elo[.SD, on = .(team = away_team, date), elo, roll = TRUE]]
+
+min_elo_by_team <- historical_elo[, .(min_elo_away = min(date)), by = team]
+
+historical_matches <- merge(
+  historical_matches,
+  min_elo_by_team,
+  by.x = "away_team",
+  by.y = "team",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+# Force values to be NA if earlier than data source
+historical_matches[date < min_elo_home, home_elo := NA]
+historical_matches[date < min_elo_away, away_elo := NA]
+historical_matches[, min_elo_home := NULL]
+historical_matches[, min_elo_away := NULL]
+
+# Reorder columns
+order <-  c("match_id", "date", "season", "home_team", "away_team", "home_goals", "away_goals", "result", "home_elo", "away_elo")
+
+# Changing the structure of results
+results_2526 <- results_2526 %>%
+  rename(
+    match_number = Match.Number,
+    gameweek     = Round.Number,
+    home_team    = Home.Team,
+    away_team    = Away.Team,
+    result       = Result,
+    location     = Location,
+    date         = Date
+  )
+
+results_2526 <- results_2526 %>%
+  separate(result, into = c("home_goals", "away_goals"), sep = "-", convert = TRUE) %>%
+  mutate(
+    result = case_when(
+      home_goals > away_goals ~ "H",
+      home_goals < away_goals ~ "A",
+      TRUE ~ "D"
+    )
+  )
+```
+
+# Helper functions
+
+```{r}
+# Function to map team names to the same standard
+
+# Name mapping, current name = new name
+team_map <- c(
+  "Man Utd" = "Manchester Utd",
+  "Man City" = "Manchester City",
+  "Spurs" = "Tottenham",
+  "Nott'm Forest" = "Nottingham Forest",
+  "Newcastle" = "Newcastle Utd",
+  "Leeds" = "Leeds United"
+)
+
+align_team_names <- function(table, mapping_dict, cols = c("home_team", "away_team")) {
+  table <- table %>%
+    mutate(
+      across(
+        all_of(cols),
+        ~ recode(.x, !!!mapping_dict, .default = .x)
+      )
+    )
+  
+  return(table)
+}
+
+results_2526 <- align_team_names(results_2526, team_map)
+```
+
+
+```{r}
+# -----------------------
+# 1. Function to map end of season points to 1-14 rank scale
+# -----------------------
+
+points_to_rank <- function(points) {
+  cuts <- c(-Inf, 24, 29, 34, 39, 44, 49, 54, 59, 64, 69, 74, 79, 84, Inf)
+  # label 14..1 so higher points -> 1 (strongest)
+  rank_num <- cut(points, breaks = cuts, labels = 14:1, right = TRUE)
+  as.integer(as.character(rank_num))
+}
+
+# -----------------------
+# 2. Function to compute expected end of season points incorporating prev 5 seasons
+# As was done in pi-football
+# -----------------------
+
+compute_component1_mean <- function(season_points, current_season_points, cur_season) {
+  
+  # --- Teams to process
+  teams <- unique(current_season_points$team)
+  
+  # --- Prior
+  prior_mean <- 57
+  prior_var  <- 300
+  
+  # --- Variance inflation for previous seasons
+  prev_add <- c(3^6, 3^5, 3^4, 3^3, 3^2)   # oldest -> most recent
+  names(prev_add) <- paste0("prev", 5:1)
+  
+  # --- Process each team
+  out <- lapply(teams, function(team_name) {
+    
+    # --- Historical points (length guaranteed to be 5)
+    prev_pts <- sapply(1:5, function(i) {
+      s_i <- cur_season - i
+      v <- season_points %>%
+           filter(season == s_i, team == team_name) %>%
+           pull(points)
+      if (length(v) == 0) {
+        NA_real_
+      } else {
+        as.numeric(v[1])  # ensure a numeric scalar
+      }
+    })
+
+    # --- Current season points
+    cur_row <- current_season_points %>% filter(team == team_name)
+    cur_points <- ifelse(nrow(cur_row) == 0, NA_real_, cur_row$total_points)
+    matches_played <- ifelse(nrow(cur_row) == 0, NA_integer_, cur_row$matches_played)
+    
+    # --- Combine inputs
+    inputs <- c(prev_pts, current = cur_points)
+  
+    # --- Variances
+    prev_vars <- prior_var + prev_add
+    cur_var <- if (is.na(matches_played)) {
+      prior_var + mean(prev_add)
+    } else {
+      exponent <- 6 - ((matches_played / 38) * 4)
+      prior_var + 3^exponent
+    }
+    vars <- c(prev_vars, current = cur_var)
+    
+    # --- Observed indices
+    obs_idx <- which(!is.na(inputs))
+    
+    # --- Posterior mean and variance
+    if (length(obs_idx) == 0) {
+      mean_post <- NA_real_
+      var_post  <- NA_real_
+    } else {
+      precisions <- 1 / vars[obs_idx]
+      weighted_sum <- sum(inputs[obs_idx] * precisions)
+      post_precision <- sum(precisions)
+      
+      mean_post <- (prior_mean / prior_var + weighted_sum) / (1 / prior_var + post_precision)
+      var_post  <- 1 / (1 / prior_var + post_precision)
+    }
+    
+    tibble(team = team_name, Mean = mean_post, Var = var_post)
+  })
+  
+  bind_rows(out)
+}
+
+# -----------------------
+# 3. Function to discretise goal difference and ELO
+# -----------------------
+
+discretise_features <- function(df,
+                                goaldiff_breaks = c(-Inf, -30, -20, -10, 0, 10, 20, 30, Inf),
+                                goaldiff_labels = NULL,
+                                elo_breaks = NULL,   # if NULL will use quantiles
+                                prev_breaks = NULL,  # if NULL will use quantiles
+                                elo_labels = NULL,
+                                prev_labels = NULL) {
+  # GoalDiff labels: if not supplied, create labels that match number of intervals
+  n_gd_intervals <- length(goaldiff_breaks) - 1
+  if (is.null(goaldiff_labels)) {
+    lefts  <- head(goaldiff_breaks, -1)
+    rights <- tail(goaldiff_breaks, -1)
+    goaldiff_labels <- vapply(seq_len(n_gd_intervals),
+                              function(i) paste0("(", lefts[i], ",", rights[i], "]"),
+                              character(1), USE.NAMES = FALSE)
+  } else {
+    if (length(goaldiff_labels) != n_gd_intervals) {
+      stop("goaldiff_labels length must equal number of intervals (length(goaldiff_breaks)-1).")
+    }
+  }
+
+  df$goal_difference_bin <- cut(df$projected_goal_difference,
+                                breaks = goaldiff_breaks,
+                                labels = goaldiff_labels,
+                                include.lowest = TRUE)
+
+  # ELO
+  if ("elo" %in% colnames(df)) {
+    if (is.null(elo_breaks)) {
+      elo_breaks <- unique(quantile(df$elo, probs = c(0, .25, .5, .75, 1), na.rm = TRUE))
+  }
+    if (is.null(elo_labels)) {
+      n_elo_intervals <- length(elo_breaks) - 1
+      elo_labels <- paste0("rating", seq_len(n_elo_intervals))
+  } else {
+    if (length(elo_labels) != (length(elo_breaks) - 1)) {
+      stop("elo_labels length must equal number of intervals (length(elo_breaks)-1).")
+    }
+  }
+  df$elo_bin <- cut(df$elo, breaks = elo_breaks, labels = elo_labels, include.lowest = TRUE)
+  
+  } else {
+      if (is.null(elo_breaks)) {
+        elo_breaks <- unique(quantile(df$rating, probs = c(0, .25, .5, .75, 1), na.rm = TRUE))
+    }
+    if (is.null(elo_labels)) {
+      n_elo_intervals <- length(elo_breaks) - 1
+      elo_labels <- paste0("rating", seq_len(n_elo_intervals))
+    } else {
+      if (length(elo_labels) != (length(elo_breaks) - 1)) {
+        stop("elo_labels length must equal number of intervals (length(elo_breaks)-1).")
+    }
+  }
+  df$elo_bin <- cut(df$rating, breaks = elo_breaks, labels = elo_labels, include.lowest = TRUE)
+    
+  }
+
+  return(df)
+}
+
+# -----------------------
+# 3. Function to discretise goal difference
+# -----------------------
+
+# Add goal difference bin to season tables
+discretise_gd <- function(df,
+                                goaldiff_breaks = c(-Inf, -30, -20, -10, 0, 10, 20, 30, Inf),
+                                goaldiff_labels = NULL) {
+  
+  # GoalDiff labels: if not supplied, create labels that match number of intervals
+  n_gd_intervals <- length(goaldiff_breaks) - 1
+  if (is.null(goaldiff_labels)) {
+    lefts  <- head(goaldiff_breaks, -1)
+    rights <- tail(goaldiff_breaks, -1)
+    goaldiff_labels <- vapply(seq_len(n_gd_intervals),
+                              function(i) paste0("(", lefts[i], ",", rights[i], "]"),
+                              character(1), USE.NAMES = FALSE)
+  } else {
+    if (length(goaldiff_labels) != n_gd_intervals) {
+      stop("goaldiff_labels length must equal number of intervals (length(goaldiff_breaks)-1).")
+    }
+  }
+
+  df$goal_difference_bin <- cut(df$gd,
+                                breaks = goaldiff_breaks,
+                                labels = goaldiff_labels,
+                                include.lowest = TRUE)
+
+  return(df) 
+}
+
+# -----------------------
+# 4. Discrete normal builder
+# -----------------------
+
+# Discrete-normal builder
+discrete_normal_probs <- function(mu, sd, n) {
+  x <- seq_len(n)
+  p <- dnorm(x, mean = mu, sd = sd)
+  if (all(p == 0)) p <- rep(1/n, n)
+  p / sum(p)
+}
+
+# -----------------------
+# 5. Building CPT table
+# -----------------------
+
+# Build CPT by shifting base marginal distribution
+build_cpt_from_base_shift3 <- function(base_rank_p,
+                                       parent_grid,
+                                       shift_currexp = NULL,
+                                       shift_gd = NULL,
+                                       shift_elo = NULL,
+                                       sd_multiplier = 1.0,
+                                       alpha = 1.0,
+                                       pseudo_scale = 1000) {
+  # base_rank_p: numeric vector length n_rank summing to 1
+  # parent_grid: data.frame with columns current_exp_points_bin, goal_difference_bin, elo_bin
+  # shift_*: named numeric vectors, names must match factor levels in parent_grid
+  n_rank <- length(base_rank_p)
+  ranks <- seq_len(n_rank)
+  mu0 <- sum(ranks * base_rank_p)                       # baseline mean rank
+  sd0  <- sqrt(sum((ranks - mu0)^2 * base_rank_p))     # baseline sd
+  if (sd0 == 0) sd0 <- 1.0
+
+  n_configs <- nrow(parent_grid)
+  cpt_mat <- matrix(NA, nrow = n_rank, ncol = n_configs)
+  colnames(cpt_mat) <- apply(parent_grid, 1, paste, collapse = "|")
+
+  for (i in seq_len(n_configs)) {
+    row <- parent_grid[i, , drop = TRUE]
+    s_curr <- if (!is.null(shift_currexp)) shift_currexp[[ as.character(row$current_exp_points_bin) ]] else 0
+    s_gd   <- if (!is.null(shift_gd))         shift_gd[[ as.character(row$goal_difference_bin) ]] else 0
+    s_elo  <- if (!is.null(shift_elo))        shift_elo[[ as.character(row$elo_bin) ]] else 0
+    total_shift <- sum(c(s_curr, s_gd, s_elo), na.rm = TRUE)
+    mu_new <- mu0 - total_shift    # decrease numeric rank for positive shift
+    sd_new <- sd0 * sd_multiplier
+    p_new <- discrete_normal_probs(mu_new, sd_new, n_rank)
+
+    # Dirichlet-like smoothing: convert p_new to pseudo-counts, add alpha, renormalize
+    if (!is.null(alpha) && alpha > 0) {
+      counts <- p_new * pseudo_scale
+      p_smoothed <- (counts + alpha) / (sum(counts) + alpha * n_rank)
+      p_new <- p_smoothed
+    }
+    cpt_mat[, i] <- p_new
+  }
+  list(cpt_mat = cpt_mat, parent_labels = colnames(cpt_mat))
+}
+
+# -----------------------
+# 6. Converting CPT matrix to array for bnlearn
+# -----------------------
+
+# Convert cpt matrix to bnlearn array (rank x currExp x GD x Elo)
+# Corrected matrix -> cpt array conversion
+matrix_to_cpt_array3 <- function(cpt_mat, parent_levels, rank_names = NULL) {
+  # cpt_mat: matrix with rows = ranks, cols = parent configurations
+  # parent_levels: named list in the order: current_exp_points_bin, goal_difference_bin, elo_bin
+  if (is.null(rank_names)) rank_names <- as.character(seq_len(nrow(cpt_mat)))
+  # dims: n_rank, nCurrExp, nGD, nElo
+  dims <- c(nrow(cpt_mat), vapply(parent_levels, length, integer(1)))
+  dimnames_list <- c(list(rank = rank_names), parent_levels)
+  arr <- array(NA_real_, dim = dims, dimnames = dimnames_list)
+
+  # Build grid in the same order as parent_levels (expand.grid uses order of list)
+  grid <- expand.grid(parent_levels, stringsAsFactors = FALSE)
+
+  # Create column ids from grid and compare to column names of cpt_mat
+  col_ids_grid <- apply(grid, 1, paste, collapse = "|")
+  if (!is.null(colnames(cpt_mat))) {
+    if (!all(col_ids_grid == colnames(cpt_mat))) {
+      stop("Column ordering/labels of parent_grid (from expand.grid) do not match colnames(cpt_mat).\n",
+           "First few grid ids: ", paste(head(col_ids_grid, 6), collapse = ", "), "\n",
+           "First few cpt_mat colnames: ", paste(head(colnames(cpt_mat), 6), collapse = ", "))
+    }
+  }
+
+  # For every column j place cpt_mat[,j] into the corresponding slice
+  for (j in seq_len(ncol(cpt_mat))) {
+    # pick the parent values for this column
+    parent_vals <- as.list(grid[j, , drop = TRUE])
+    # find position indices for each parent level
+    indices <- lapply(seq_along(parent_vals), function(k) {
+      match(as.character(parent_vals[[k]]), dimnames_list[[k + 1]])
+    })
+    # now assign into arr: arr[, idx2, idx3, idx4] <- cpt_mat[, j]
+    # build the call dynamically to support N parents (here 3 parents expected)
+    if (length(indices) == 3) {
+      arr[, indices[[1]], indices[[2]], indices[[3]]] <- cpt_mat[, j]
+    } else {
+      # generic multi-parent assignment (supports different number of parent dims)
+      # build index list: first is full rank slice, then each parent index
+      idx_list <- c(list(seq_len(nrow(cpt_mat))), indices)
+      # use do.call with '[' replacement via an intermediate approach
+      # convert arr into vector and compute linear indices is more complex; simplest: use recursive assignment
+      # fallback for unusual parent counts:
+      stop("matrix_to_cpt_array3 currently supports exactly 3 parent dimensions in parent_levels.")
+    }
+  }
+  return(arr)
+}
+
+# -----------------------------------------------------
+# 7. Function to calculate a conditional probability table
+# -----------------------------------------------------
+
+# Building a conditional probability table giving the probability of a rank x
+# team beating a rank y team
+
+build_empirical_cpt <- function(historical_matches, season_points, lambda=1) {
+  # 1. Prepare season points and ranks
+  sp <- season_points %>%
+    mutate(rank = points_to_rank(points))
+  
+  # 2. Merge ranks for home and away teams
+  HM <- historical_matches %>%
+    left_join(sp %>% dplyr::select(season, team, rank),
+              by = c("season", "home_team"="team")) %>%
+    rename(rank_home = rank) %>%
+    left_join(sp %>% dplyr::select(season, team, rank),
+              by = c("season", "away_team"="team")) %>%
+    rename(rank_away = rank) %>%
+    mutate(rank_home = if_else(is.na(rank_home), 12, rank_home)) %>%
+    mutate(rank_away = if_else(is.na(rank_away), 12, rank_away))
+  
+  # 3. Compute match results
+  HM <- HM %>% 
+    mutate(result = case_when(
+      home_goals > away_goals ~ "H",
+      home_goals == away_goals ~ "D",
+      home_goals < away_goals  ~ "A"
+    ))
+  
+  # 4. Count outcomes for each (rank_home, rank_away, result)
+  cpt <- HM %>%
+    group_by(rank_home, rank_away, result) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    tidyr::complete(rank_home = 1:14, rank_away = 1:14, result = c("H","D","A"),
+                    fill = list(n = 0)) %>%
+    group_by(rank_home, rank_away) %>%
+    # Apply Dirichlet smoothing: add lambda pseudo-count to each outcome
+    mutate(total = sum(n),
+           p = (n + lambda) / (total + 3 * lambda)) %>%
+    ungroup()
+  
+  # 5. Pivot to wide format
+  cpt_wide <- cpt %>%
+    dplyr::select(rank_home, rank_away, result, p) %>%
+    tidyr::pivot_wider(
+      names_from = result,
+      values_from = p, 
+      names_prefix = "p_"
+    ) %>%
+    arrange(rank_home, rank_away)
+  
+  # 6. Build 3D array for bnlearn CPT
+  res_array <- array(0, dim = c(14, 14, 3),
+                     dimnames = list(rank_home = as.character(1:14),
+                                     rank_away = as.character(1:14),
+                                     result = c("H","D","A")))
+  
+  for(i in seq_len(nrow(cpt_wide))) {
+    rh <- as.character(cpt_wide$rank_home[i])
+    ra <- as.character(cpt_wide$rank_away[i])
+    res_array[rh, ra, "H"] <- cpt_wide$p_H[i]
+    res_array[rh, ra, "D"] <- cpt_wide$p_D[i]
+    res_array[rh, ra, "A"] <- cpt_wide$p_A[i]
+  }
+
+  list(cpt_wide = cpt_wide, cpt_array = res_array, ranked_matches = HM)
+}
+
+# ------------------
+# 8. If else helper
+# ------------------
+
+`%||%` <- function(a,b) if (!is.null(a) && !any(is.na(a))) a else b
+```
+
+# 4. Data manipulation and node calculation
+
+```{r}
+# Calculate mean and variance for each team
+# Mean of current projected points and previous 5 seasons
+# 2025/26 season
+current_mean_variance_df <- compute_component1_mean(
+  season_points = season_tables,
+  current_season_points = current_table,
+  cur_season = 2026 # 2025 would be used to predict 24/25 season
+)
+
+# Merge ELO ratings onto current table
+current_table <- merge(current_table, elo_ratings, by = "team")
+
+# Project goal difference forward to the end of the season
+current_table$projected_goal_difference <- current_table$goal_difference / current_table$matches_played * 38
+
+# Discretise ELO and goal difference into bins
+current_table_discrete <- discretise_features(
+  df = current_table,
+)
+
+# Merging on the expected points generated according to pi football - incorporating current + prev 5 seasons
+current_table_discrete <- merge(current_table_discrete, current_mean_variance_df %>% dplyr::select(c("team", "Mean")))
+names(current_table_discrete)[names(current_table_discrete) == 'Mean'] <- 'current_exp_points'
+
+# Discretising current expected points
+current_table_discrete$current_exp_points_bin <- cut(current_table_discrete$current_exp_points,
+                                 breaks = quantile(current_table_discrete$current_exp_points, probs = c(0, .33, .66, 1), na.rm=TRUE),
+                                 include.lowest = TRUE,
+                                 labels = c("Low","Med","High"))
+
+# Bin goal differences from end of sesaon tables
+season_tables <- discretise_gd(season_tables)
+
+# Converting historical points into ranks
+season_tables$rank <- points_to_rank(season_tables$points)
+
+season_tables$elo_bin <- cut(season_tables$elo,
+        breaks = quantile(
+        season_tables$elo,
+        probs = c(0, .25, .5, .75, 1), na.rm=TRUE
+      ),
+      include.lowest = TRUE,
+      labels = c("rating1","rating2","rating3","rating4"))
+```
+
+# 5 Functions for fitting the BN
+
+```{r}
+# Helper: build empirical marginal or uniform fallback
+
+build_marginal <- function(node_name, levels) {
+
+    # try season_tables first, then current_table_discrete, else uniform
+  if (node_name %in% names(season_tables)) {
+    tab <- table(as.character(season_tables[[node_name]]))
+    vec <- setNames(as.numeric(tab[levels]), names(tab)[match(levels, names(tab))])
+    vec[is.na(vec)] <- 0
+    if (sum(vec) > 0) return(vec / sum(vec))
+  }
+  if (node_name %in% names(current_table_discrete)) {
+    tab <- table(as.character(current_table_discrete[[node_name]]))
+    vec <- setNames(as.numeric(tab[levels]), names(tab)[match(levels, names(tab))])
+    vec[is.na(vec)] <- 0
+    if (sum(vec) > 0) return(vec / sum(vec))
+  }
+  # fallback uniform
+  setNames(rep(1/length(levels), length(levels)), levels)
+}
+```
+
+# 5.1 Generating node distributions
+
+```{r}
+# -----------------------
+# 1. Compute base marginal P(Rank) from historical data
+# -----------------------
+# season_tables must have column 'rank' (1..14)
+n_rank <- 14
+base_rank_counts <- season_tables %>%
+  count(rank) %>%
+  arrange(as.integer(rank))
+# ensure all ranks 1..14 present
+all_ranks <- as.integer(1:n_rank)
+counts_complete <- rep(0, n_rank)
+names(counts_complete) <- as.character(all_ranks)
+counts_complete[as.character(base_rank_counts$rank)] <- base_rank_counts$n
+base_rank_p <- counts_complete / sum(counts_complete)  # marginal P(Rank)
+
+# -----------------------
+# 2. Build parent_levels & parent_grid
+# -----------------------
+# parent levels should come from the union of levels you will use in your BN.
+# For hybrid we create a grid of possible parent states to produce P(R|parents)
+parent_levels <- list(
+  current_exp_points_bin = sort(unique(as.character(current_table_discrete$current_exp_points_bin))),
+  goal_difference_bin    = sort(unique(as.character(season_tables$goal_difference_bin))),
+  elo_bin                = sort(unique(as.character(season_tables$elo_bin)))
+)
+parent_grid <- expand.grid(parent_levels, stringsAsFactors = FALSE)
+
+# -----------------------
+# 3. Define expert shifts
+#    Positive shifts -> improve expected rank (i.e., lower numeric rank)
+# -----------------------
+
+# Shift for current expected points node
+shift_currexp <- c(Low = -3, Med = 0.0, High = 3.0)
+
+# goal_difference shift (example: larger positive GD -> bigger positive shift)
+gd_shift_vals <- c(-3.0, -2, -1.5, -0.5, 0.5, 1.5, 2, 3.0)
+names(gd_shift_vals) <- c("(-Inf,-30]", "(-30,-20]", "(-20,-10]", "(-10,0]", "(0,10]", "(10,20]", "(20,30]", "(30,Inf)")
+shift_gd <- gd_shift_vals
+
+# ELO rating shift
+shift_elo <- c(rating1 = -1, rating2 = 0.0, rating3 = 1, rating4 = 2)
+
+# Ensure shift vectors have proper names consistent with parent_levels
+if (!all(names(shift_currexp) %in% parent_levels$current_exp_points_bin)) {
+  # attempt to auto-name using parent levels if shift_currexp was built with generic names
+  names(shift_currexp) <- parent_levels$current_exp_points_bin[seq_along(shift_currexp)]
+}
+if (!all(names(shift_gd) %in% parent_levels$goal_difference_bin)) {
+  names(shift_gd) <- parent_levels$goal_difference_bin[seq_along(shift_gd)]
+}
+if (!all(names(shift_elo) %in% parent_levels$elo_bin)) {
+  names(shift_elo) <- parent_levels$elo_bin[seq_along(shift_elo)]
+}
+
+# -----------------------
+# 4. Build CPT matrix using shift rule + smoothing
+# -----------------------
+cpt_build_res <- build_cpt_from_base_shift3(
+  base_rank_p = base_rank_p,
+  parent_grid = parent_grid,
+  shift_currexp = shift_currexp,
+  shift_gd = shift_gd,
+  shift_elo = shift_elo,
+  sd_multiplier = 1.0,
+  alpha = 1.0,
+  pseudo_scale = 1000
+)
+cpt_mat <- cpt_build_res$cpt_mat  # matrix: rows = ranks (1..14), cols = parent configs
+
+# Quick check: columns sum to 1
+stopifnot(all(abs(colSums(cpt_mat) - 1) < 1e-8))
+
+# -----------------------
+# 5-6. Prepare CPT array and fit BN
+# -----------------------
+
+# 1) Convert CPT matrix to array
+rank_names <- as.character(seq_len(n_rank))  # 1..14
+cpt_arr <- matrix_to_cpt_array3(cpt_mat, parent_levels = parent_levels, rank_names = rank_names)
+
+# 2) Ensure dim_list exists (sync with cpt_arr dimnames)
+
+# Create/restore dim_list from cpt_arr dimnames in a robust way.
+if (!exists("dim_list") || is.null(dim_list)) {
+  dn <- dimnames(cpt_arr)
+
+  # If per-axis labels are missing, try to build them from parent_levels & rank_names
+  if (is.null(dn)) {
+    dn <- c(list(rank = rank_names), parent_levels)
+  } else {
+    # ensure per-axis labels exist (fill missing with parent_levels / rank_names)
+    nd <- length(dim(cpt_arr))
+    if (length(dn) != nd) {
+      # normalize to length
+      full_dn <- vector("list", nd)
+      full_dn[seq_len(min(length(dn), nd))] <- dn[seq_len(min(length(dn), nd))]
+      dn <- full_dn
+    }
+    # fill missing axis labels using known sources
+    for (i in seq_along(dn)) {
+      if (is.null(dn[[i]])) {
+        # first axis -> rank_names, others -> parent_levels in order
+        if (i == 1) {
+          dn[[i]] <- as.character(rank_names)
+        } else {
+          pl_names <- names(parent_levels)
+          if (!is.null(pl_names) && length(pl_names) >= (i - 1)) {
+            dn[[i]] <- as.character(parent_levels[[pl_names[i - 1]]])
+          } else {
+            dn[[i]] <- paste0("Level", i, seq_len(dim(cpt_arr)[i]))
+          }
+        }
+      }
+    }
+  }
+
+  # Ensure axis names (names(dn)) are present and in expected order
+  expected_axis_names <- c("rank", names(parent_levels))
+  if (length(dn) == length(expected_axis_names)) {
+    # if there are no names, set them; if some names present but different length, override safely
+    names(dn) <- expected_axis_names
+  } else {
+    # fallback: set names to HomeRank + parent names for the first matching positions
+    names(dn) <- expected_axis_names[seq_along(dn)]
+  }
+
+  dim_list <- dn
+}
+
+# 3) Handle single-level parents by adding dummy level
+# Robust way to add a dummy level for any parent that currently has only one level
+
+dist_list <- list()
+
+for (parent in names(parent_levels)) {
+  # find axis position (must exist in dim_list)
+  axis_pos <- which(names(dim_list) == parent)
+  if (length(axis_pos) == 0) stop("Axis '", parent, "' not found in dim_list/dimnames(cpt_arr).")
+
+  # If the axis currently has only 1 level, expand it to 2 (add "dummy")
+  if (length(dim_list[[axis_pos]]) == 1) {
+    # current dimnames and dims
+    old_dn <- dim_list
+    old_names <- names(old_dn)
+    dims <- dim(cpt_arr)
+    dims[axis_pos] <- 2
+
+    # replicate values of cpt_arr along that axis (repeat each slice)
+    # We repeat the flattened values in a way that keeps ordering consistent
+    new_vals <- rep(as.vector(cpt_arr), times = 2)
+    cpt_arr <- array(new_vals, dim = dims)
+
+    # update dim_list: insert original level then "dummy" at axis_pos
+    new_dn <- old_dn
+    new_dn[[axis_pos]] <- c(old_dn[[axis_pos]][1], "dummy")
+    names(new_dn) <- old_names
+
+    # assign back both dim_list and dimnames of the array
+    dim_list <- new_dn
+    dimnames(cpt_arr) <- dim_list
+
+    # ensure dist_list has an entry; if not, create a uniform prior for the existing levels
+    if (is.null(dist_list[[parent]]) || length(dist_list[[parent]]) == 0) {
+      dist_list[[parent]] <- setNames(rep(1 / length(parent_levels[[parent]]),
+                                          length(parent_levels[[parent]])),
+                                      parent_levels[[parent]])
+    }
+
+    # append dummy with prob 0 and renormalize
+    dist_list[[parent]] <- c(dist_list[[parent]], dummy = 0)
+    if (sum(dist_list[[parent]]) == 0) {
+      # no mass — make uniform across the expanded levels
+      dist_list[[parent]] <- setNames(rep(1 / length(dist_list[[parent]]),
+                                          length(dist_list[[parent]])),
+                                      names(dist_list[[parent]]))
+    } else {
+      dist_list[[parent]] <- dist_list[[parent]] / sum(dist_list[[parent]])
+    }
+
+    message(sprintf("Expanded axis '%s' to include dummy. New levels: %s",
+                    parent, paste(dim_list[[axis_pos]], collapse = ", ")))
+  }
+}
+
+# 4) Ensure dimnames are correctly named
+dn <- dimnames(cpt_arr)
+if (is.null(names(dn))) names(dn) <- c("rank", names(parent_levels))
+dimnames(cpt_arr) <- dn
+
+# 5) Reorder array axes to match DAG (child first, then parents)
+expected_parents <- names(parent_levels)
+perm_order <- match(c("rank", expected_parents), names(dimnames(cpt_arr)))
+cpt_arr <- aperm(cpt_arr, perm = perm_order)
+```
+
+```{r}
+# --- Robust preparation of dist_list and assignment of CPT ---
+
+# Identify child/axis names from cpt_arr
+dn <- dimnames(cpt_arr)
+axis_names <- names(dn)
+if (is.null(axis_names) || length(axis_names) < 1) stop("dimnames(cpt_arr) must have axis names set.")
+
+child_name <- axis_names[1]
+expected_parents <- axis_names[-1]
+
+# Ensure dist_list exists
+if (!exists("dist_list") || is.null(dist_list)) dist_list <- list()
+
+# For each parent, ensure dist_list[[parent]] is a named prob vector matching dimnames(cpt_arr)[[parent]]
+for (parent in expected_parents) {
+  desired_levels <- as.character(dimnames(cpt_arr)[[parent]])
+  if (is.null(desired_levels) || length(desired_levels) == 0) {
+    stop("dimnames(cpt_arr)[[", parent, "]] is NULL/empty. Fix cpt_arr dimnames first.")
+  }
+
+  cur <- dist_list[[parent]]
+
+  if (is.null(cur) || length(cur) == 0) {
+    # build an empirical prior or uniform fallback
+    dist_list[[parent]] <- build_marginal(parent, desired_levels)
+    message(sprintf("Initialized dist_list[['%s']] with %d levels (sum=%g).",
+                    parent, length(dist_list[[parent]]), sum(dist_list[[parent]])))
+  } else {
+    # If present but names don't match, align by intersection or fill missing with zeros
+    if (is.null(names(cur)) || !all(desired_levels %in% names(cur))) {
+      newv <- setNames(numeric(length(desired_levels)), desired_levels)
+      if (!is.null(names(cur))) {
+        common <- intersect(names(cur), desired_levels)
+        if (length(common) > 0) newv[common] <- cur[common]
+      }
+      if (sum(newv) == 0) {
+        # fallback: uniform
+        newv[] <- 1 / length(newv)
+      } else {
+        newv <- newv / sum(newv)
+      }
+      dist_list[[parent]] <- newv
+      message(sprintf("Re-aligned dist_list[['%s']] to desired levels.", parent))
+    } else {
+      # names match: reorder to desired_levels and normalize
+      vec <- as.numeric(cur[desired_levels])
+      names(vec) <- desired_levels
+      if (sum(vec) == 0) vec[] <- 1 / length(vec)
+      dist_list[[parent]] <- vec / sum(vec)
+    }
+  }
+  # Final safety: ensure numeric and sums to 1
+  if (!is.numeric(dist_list[[parent]])) stop("dist_list[[", parent, "]] must be numeric.")
+  dist_list[[parent]] <- dist_list[[parent]] / sum(dist_list[[parent]])
+}
+
+# Assign CPT array to the child node in dist_list
+dist_list[[child_name]] <- cpt_arr
+
+# ----------------
+# Defining the DAG
+# ----------------
+
+model_string <- "[rank|current_exp_points_bin:goal_difference_bin:elo_bin][current_exp_points_bin][goal_difference_bin][elo_bin]"
+dag <- model2network(model_string)
+
+# -----------------
+# Validation checks
+# -----------------
+
+#  1. every node in dag_example must have an entry in dist_list
+missing_nodes <- setdiff(nodes(dag), names(dist_list))
+if (length(missing_nodes) > 0) stop("dist_list missing entries for nodes: ", paste(missing_nodes, collapse = ", "))
+
+if ("elo_bin" %in% names(dist_list)) {
+  lv <- names(dist_list[["elo_bin"]])
+  if (any(is.na(lv))) {
+    lv[is.na(lv)] <- "dummy"
+    names(dist_list[["elo_bin"]]) <- lv
+  }
+}
+
+#  2. parents' names align
+for (parent in expected_parents) {
+  if (!all(as.character(dimnames(cpt_arr)[[parent]]) %in% names(dist_list[[parent]]))) {
+    stop("Parent levels in cpt_arr and dist_list do not align for parent: ", parent)
+  }
+}
+
+for (parent in expected_parents) {
+  probs <- dist_list[[parent]]
+  dist_list[[parent]] <- table(factor(names(probs), levels = names(probs)))  # ensure levels
+  dist_list[[parent]][] <- probs  # assign probabilities
+}
+```
+
+# 5.2 Fitting the BN
+
+```{r}
+# Fit BN
+fitted_custom <- bnlearn::custom.fit(dag, dist = dist_list)
+```
+
+# 6. Generating predictions from the BN
+
+# 6.1 Helper functions for predictions
+
+```{r}
+# --------------------------------
+# Get rank distribution for a team
+# --------------------------------
+
+# sample conditional distribution of `node` given evidence_list
+get_rank_dist <- function(fitted_bn, evidence_list, n = 20000, seed = 2025) {
+  
+  # Seed for reproducibility
+  # set.seed(seed)
+  
+  # Sample rank from the fitted BN based on the values of parent nodes
+  samp <- cpdist(fitted_bn, nodes = "rank", evidence = evidence_list, method = "lw", n = n)
+  
+  levels_all <- if (!is.null(fitted_bn[["rank"]]$prob)) dimnames(fitted_bn[["rank"]]$prob)[[1]] else levels(samp[["rank"]])
+  probs <- prop.table(table(factor(samp[["rank"]], levels = levels_all)))
+  setNames(as.numeric(probs), names(probs))
+}
+
+# ---------------------------------
+# Get parent node values for a team
+# ---------------------------------
+
+build_evidence <- function(row, prefix = "home_", fitted_bn) {
+  
+  # Parent nodes of rank node
+  parents <- fitted_bn[["rank"]]$parents
+  
+  vals <- lapply(parents, function(p) {
+    col <- paste0(prefix, p)
+    as.character(row[[col]])    # scalar, with factor label (not internal code)
+  })
+  names(vals) <- parents
+  vals   # named list of length-1 character scalars
+}
+
+# --------------------
+# Predict match result
+# --------------------
+
+predict_match <- function(fitted_bn, match_cpt, home_ev, away_ev, n = 20000, seed = 2025) {
+  
+  # Get rank distribution for home team
+  h <- get_rank_dist(fitted_bn, home_ev, n = n, seed = seed)
+  
+  # Get rank distribution for away team
+  a <- get_rank_dist(fitted_bn, away_ev, n = n, seed = seed + 1)
+  
+  # Compute the joint probability of each rank pair
+  # P(rank_h, rank_a) = P(rank_h | evidence_h)*P(rank_a | evidence_a)
+  P_pair <- h[as.character(match_cpt$rank_home)] * a[as.character(match_cpt$rank_away)]
+    
+  # P(H) = P(rank_h, rank_a)*P(H | rank_h, rank_a) summed over all rank pairs
+  p_H <- sum(P_pair * match_cpt$p_H)
+  # P(D) = P(rank_h, rank_a)*P(D | rank_h, rank_a) summed over all rank pairs
+  p_D <- sum(P_pair * match_cpt$p_D)
+  # P(A) = P(rank_h, rank_a)*P(A | rank_h, rank_a) summed over all rank pairs
+  p_A <- sum(P_pair * match_cpt$p_A)
+  
+  probs <- c(p_H = p_H, p_D = p_D, p_A = p_A)
+  # Normalise probabilities to 1
+  probs / sum(probs)
+}
+
+# -------------------------------------
+# Function to predict multiple fixtures
+# -------------------------------------
+
+predict_fixtures <- function(fixtures_df, fitted_bn, match_cpt, n = 20000, seed = 2025) {
+  
+  preds <- t(sapply(seq_len(nrow(fixtures_df)), function(i) {
+    row <- fixtures_df[i, , drop = FALSE]
+    home_ev <- build_evidence(row, "home_", fitted_bn)
+    away_ev <- build_evidence(row, "away_", fitted_bn)
+    predict_match(fitted_bn, match_cpt, home_ev, away_ev, n = n, seed = seed + i)
+  }))
+  cbind(fixtures_df, as.data.frame(preds))
+}
+
+# ------------------------------------------------
+# Function to generate tables after each gameweek
+# ------------------------------------------------
+
+build_standings_by_gw <- function(results2,
+                                  matches_per_gameweek = 10,
+                                  home_col = "home_team", away_col = "away_team",
+                                  hg_col = "home_goals", ag_col = "away_goals",
+                                  result_col = "result", match_id_col = "match_id",
+                                  home_elo_col = "home_elo", away_elo_col = "away_elo") {
+  
+  # turn each match into two rows (one per team) and include elo
+  long <- bind_rows(
+    results2 %>%
+      transmute(match_id, gameweek,
+                team = .[[home_col]],
+                gf = .[[hg_col]],
+                ga = .[[ag_col]],
+                result = .[[result_col]],
+                elo = .[[home_elo_col]]) %>%
+      mutate(points = case_when(result == "H" ~ 3, result == "D" ~ 1, TRUE ~ 0)),
+    results2 %>%
+      transmute(match_id, gameweek,
+                team = .[[away_col]],
+                gf = .[[ag_col]],
+                ga = .[[hg_col]],
+                result = .[[result_col]],
+                elo = .[[away_elo_col]]) %>%
+      mutate(points = case_when(result == "A" ~ 3, result == "D" ~ 1, TRUE ~ 0))
+  ) %>%
+    arrange(team, gameweek, match_id)
+
+  # cumulative sums per team across gameweeks (by match order)
+  team_gw_cum <- long %>%
+    group_by(team) %>%
+    arrange(gameweek, match_id) %>%
+    mutate(
+      gd = gf - ga,
+      cum_points = cumsum(points),
+      cum_gd = cumsum(gd),
+      cum_gf = cumsum(gf),
+      last_elo = elo   # store last known elo per match
+    ) %>%
+    group_by(team, gameweek) %>%
+    slice_tail(n = 1) %>%
+    ungroup() %>%
+    dplyr::select(team, gameweek,
+           points = cum_points,
+           goal_difference = cum_gd,
+           goals_for = cum_gf,
+           elo = last_elo)
+
+  # full grid: every team × every gameweek (so teams that didn't play retain last known totals)
+  all_gw <- seq_len(max(results2$gameweek, na.rm = TRUE))
+  teams <- sort(unique(long$team))
+  full <- expand_grid(team = teams, gameweek = all_gw) %>%
+    left_join(team_gw_cum, by = c("team", "gameweek")) %>%
+    group_by(team) %>%
+    arrange(gameweek) %>%
+    # carry forward last totals for weeks with no match
+    mutate(points = zoo::na.locf(points, na.rm = FALSE),
+           goal_difference = zoo::na.locf(goal_difference, na.rm = FALSE),
+           goals_for = zoo::na.locf(goals_for, na.rm = FALSE),
+           elo = zoo::na.locf(elo, na.rm = FALSE)) %>%
+    replace_na(list(points = 0, goal_difference = 0, goals_for = 0, elo = NA)) %>%
+    ungroup()
+
+  # produce final tables per gameweek and compute position by tie-breakers
+  standings_long <- full %>%
+    group_by(gameweek) %>%
+    arrange(gameweek,
+            desc(points),
+            desc(goal_difference),
+            desc(goals_for),
+            team) %>%                # stable tie-breaker: alphabetical
+    mutate(position = row_number()) %>%
+    ungroup() %>%
+    dplyr::select(gameweek, position, team, points, goal_difference, elo) %>%
+    arrange(gameweek, position)
+
+  standings_long
+}
+
+# ----------------------------------------
+# Function to add expected points to table
+# ----------------------------------------
+
+add_exp_points_to_standings <- function(results, standings_by_gw, season_points,
+                                        compute_component1_mean,
+                                        cur_season, matches_per_gameweek = 10) {
+  # ensure results have a gameweek column
+  results2 <- if ("gameweek" %in% names(results)) {
+    results
+  } else {
+    print("no")
+    results %>% mutate(gameweek = ceiling(as.numeric(match_id) / matches_per_gameweek))
+  }
+
+  gws <- sort(unique(standings_by_gw$gameweek))
+
+  comp_by_gw <- lapply(gws, function(gw) {
+    # 1) current points from standings (points after this gw)
+    cur_pts <- standings_by_gw %>%
+      filter(gameweek == gw) %>%
+      dplyr::select(team, total_points = points, elo)  # include elo here
+
+    # 2) matches played up to and including this gw
+    mp <- results2 %>%
+      filter(gameweek <= gw) %>%
+      transmute(team_home = home_team, team_away = away_team) %>%
+      # stack home/away to count matches per team
+      { bind_rows(
+          transmute(., team = team_home),
+          transmute(., team = team_away)
+        ) } %>%
+      count(team, name = "matches_played")
+
+    # 3) ensure every team in standings appears, missing -> 0 matches
+    cur_season_points <- cur_pts %>%
+      left_join(mp, by = "team") %>%
+      mutate(matches_played = ifelse(is.na(matches_played), 0L, matches_played))
+
+    # 4) call your function to compute component1 (returns tibble team, Mean, Var)
+    comp <- compute_component1_mean(season_points, cur_season_points, cur_season)
+
+    # attach gameweek
+    comp %>% mutate(gameweek = gw) %>% dplyr::select(gameweek, team, Mean, Var)
+  })
+
+  comp_df <- bind_rows(comp_by_gw)
+
+  # 5) join Mean (and Var) back to standings_by_gw
+  standings_by_gw %>%
+    left_join(comp_df, by = c("gameweek", "team")) %>%
+    arrange(gameweek, position) %>%
+    # ensure elo column is preserved
+    dplyr::select(gameweek, position, team, points, goal_difference, elo, everything())
+}
+
+```
+
+# Function to generate predictions for a full season
+
+```{r, warning=FALSE}
+get_predictions_for_full_season <- function(
+    season_int, historical_matches, season_tables, fitted_bn, cpt, results2526, current_gw) {
+    
+  matches_per_gameweek <- 10
+  
+  if (season_int == 2025) {
+    season_results <- results2526 %>%
+      rename(match_id = match_number) %>%
+      filter(gameweek <= current_gw)
+    season_results$season <- 2025
+  } else {
+  
+    season_results <- historical_matches[historical_matches$season == season_int, ]
+    season_results$match_id <- season_results$match_id - min(season_results$match_id) + 1
+    
+    season_results <- season_results %>%
+    mutate(
+      match_id = .[["match_id"]],
+      gameweek = ceiling(as.numeric(match_id) / matches_per_gameweek)
+    )
+  }
+  
+  standings_by_gameweek <- build_standings_by_gw(season_results, matches_per_gameweek = matches_per_gameweek)
+  
+  standings_with_expected_points <- add_exp_points_to_standings(
+    results = season_results,
+    standings_by_gw = standings_by_gameweek,
+    season_points = season_tables,
+    compute_component1_mean = compute_component1_mean,
+    cur_season = season_int + 1,
+    matches_per_gameweek = matches_per_gameweek
+  )
+  
+  # Calculate projected goal difference
+  standings_with_expected_points$projected_goal_difference <- 
+    standings_with_expected_points$goal_difference / 
+    standings_with_expected_points$gameweek * 38
+  
+  # Rounding
+  standings_with_expected_points <- standings_with_expected_points %>% 
+    mutate(across("projected_goal_difference", round, 0))
+  
+  names(standings_with_expected_points)[names(standings_with_expected_points) == 'Mean'] <- 'current_exp_points'
+  names(standings_with_expected_points)[names(standings_with_expected_points) == 'elo'] <- 'rating'
+  
+  standings_with_expected_points <- discretise_features(
+    df = standings_with_expected_points
+  )
+  
+  standings_with_expected_points$current_exp_points_bin <- 
+    cut(standings_with_expected_points$current_exp_points,
+        breaks = quantile(
+          standings_with_expected_points$current_exp_points,
+          probs = c(0, .33, .66, 1), na.rm=TRUE
+        ),
+        include.lowest = TRUE,
+        labels = c("Low","Med","High"))
+  
+  # Merging on the node columns (expected points, goal difference, ELO) with fixtures
+  # Merge on current points, goal difference and elo
+  season_results <- season_results %>%
+    left_join(
+      standings_with_expected_points %>%
+        dplyr::select("gameweek", "team", "goal_difference_bin", "elo_bin", "current_exp_points_bin") %>%
+        rename(
+          home_team                   = team,
+          home_goal_difference_bin    = goal_difference_bin,
+          home_elo_bin                = elo_bin,
+          home_current_exp_points_bin = current_exp_points_bin
+        ),
+      by = c("home_team", "gameweek")
+    ) %>%
+    left_join(
+      standings_with_expected_points %>%
+        dplyr::select("gameweek", "team", "goal_difference_bin", "elo_bin", "current_exp_points_bin") %>%
+        rename(
+          away_team                   = team,
+          away_goal_difference_bin    = goal_difference_bin,
+          away_elo_bin                = elo_bin,
+          away_current_exp_points_bin = current_exp_points_bin
+        ),
+      by = c("away_team", "gameweek")
+    )
+  
+    # Generate predictions
+    predictions <- predict_fixtures(
+      fixtures_df = season_results,
+      fitted_bn = fitted_bn,
+      match_cpt = cpt
+    )
+    
+    # Sampling home and away ranks
+    predictions <- predictions %>%
+      rowwise() %>%
+      mutate(
+        sim_rank_home = {
+          rd <- get_rank_dist(
+            fitted_bn,
+            evidence_list = list(
+              elo_bin                = home_elo_bin,
+              goal_difference_bin    = home_goal_difference_bin,
+              current_exp_points_bin = home_current_exp_points_bin
+            )
+          )
+          as.integer(sample(names(rd), size = 1, prob = rd))
+        },
+        
+        sim_rank_away = {
+          rd <- get_rank_dist(
+            fitted_bn,
+            evidence_list = list(
+              elo_bin                = away_elo_bin,
+              goal_difference_bin    = away_goal_difference_bin,
+              current_exp_points_bin = away_current_exp_points_bin
+            )
+          )
+          as.integer(sample(names(rd), size = 1, prob = rd))
+        }
+      ) %>%
+      ungroup()
+    
+    return(predictions)
+}
+```
+
+# 6.2  Building the CPT for home and away rank
+
+```{r}
+# Building CPT for home and away rank combinations
+tmp <- build_empirical_cpt(
+  historical_matches = historical_matches,
+  season_points = season_tables,
+  lambda = 1
+)
+
+cpt_array <- tmp$cpt_array
+cpt_wide <- tmp$cpt_wide
+```
+
+# 6.3 Filtering fixtures for one gameweek and adding node values
+
+```{r}
+# Filter for current week fixtures
+current_fixtures <- fixtures_2526[fixtures_2526$gameweek == 8, ]
+
+# Merge on current points, goal difference and elo
+current_fixtures <- current_fixtures %>%
+  left_join(
+    current_table_discrete %>%
+      dplyr::select("team", "goal_difference_bin", "elo_bin", "current_exp_points_bin") %>%
+      rename(
+        home_team                   = team,
+        home_goal_difference_bin    = goal_difference_bin,
+        home_elo_bin                = elo_bin,
+        home_current_exp_points_bin = current_exp_points_bin
+      ),
+    by = "home_team"
+  ) %>%
+  left_join(
+    current_table_discrete %>%
+      dplyr::select("team", "goal_difference_bin", "elo_bin", "current_exp_points_bin") %>%
+      rename(
+        away_team                   = team,
+        away_goal_difference_bin    = goal_difference_bin,
+        away_elo_bin                = elo_bin,
+        away_current_exp_points_bin = current_exp_points_bin
+      ),
+    by = "away_team"
+  )
+```
+
+# 6.4 Generating predictions
+
+# Generating predictions for the current gameweek (2025/26)
+
+```{r}
+# Generate predictions
+current_gameweek_predictions <- predict_fixtures(current_fixtures, fitted_custom, cpt_wide)
+```
+
+# Generatings predictions for each season since 2000/01
+
+```{r, warning=FALSE}
+all_predictions <- list()
+
+for (season_int in (2000:2024)){
+  message(glue("Generating predictions for season {season_int}/{season_int + 1}"))
+  
+  all_predictions[[as.character(season_int)]] <- 
+    get_predictions_for_full_season(
+      season_int = season_int,
+      historical_matches = historical_matches,
+      season_tables = season_tables,
+      fitted_bn = fitted_custom,
+      cpt = cpt_wide,
+      results2526 = results_2526,
+      current_gw = 28
+    )
+}
+```
+
+### Sampling results and scorelines
+
+```{r}
+# Get historical matches with EOS ranks added
+historical_matches_with_rank <- tmp$ranked_matches
+
+score_dist <- historical_matches_with_rank %>%
+  mutate(scoreline = paste0(home_goals, "-", away_goals)) %>%
+  group_by(rank_home, rank_away, result, scoreline) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(rank_home, rank_away, result) %>%
+  mutate(prob = n / sum(n)) %>%
+  ungroup()
+
+# Dirichlet smoothing
+score_dist_smooth <- historical_matches_with_rank %>%
+  mutate(scoreline = paste0(home_goals, "-", away_goals)) %>%
+  group_by(rank_home, rank_away, result, scoreline) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(rank_home, rank_away, result) %>%
+  tidyr::complete(scoreline, fill = list(n = 0)) %>%
+  mutate(total = sum(n),
+         prob = (n + 1) / (total + n_distinct(scoreline))) %>%
+  ungroup()
+
+# Sample the scoreline based on learned CPT
+sample_score <- function(home_rank, away_rank, outcome, score_dist) {
+  
+  home_rank <- as.numeric(home_rank)
+  away_rank <- as.numeric(away_rank)
+  
+  subset <- score_dist %>%
+    filter(
+      rank_home == home_rank,
+      rank_away == away_rank,
+      result == outcome
+    )
+  
+  if (nrow(subset) == 0) {
+    
+    if (outcome == "H") {
+      return("1-0")  # temporary fallback 
+    }
+    else if (outcome == "D") {
+      return("1-1")  # temporary fallback 
+    }
+    else if (outcome == "A") {
+      return("0-1")  # temporary fallback 
+    }
+  }
+  
+  if (any(is.na(subset$prob)) || sum(subset$prob) == 0) {
+
+    print(subset)
+    return("1-0")
+  }
+  
+  sample(subset$scoreline, size = 1, prob = subset$prob)
+}
+
+# Sample result from predictions
+sample_result <- function(p_H, p_D, p_A) {
+  sample(c("H","D","A"), size = 1, prob = c(p_H, p_D, p_A))
+}
+```
+
+# Sampling result and scoreline based on predictions
+
+```{r}
+for (season_int in (2024:2024)){
+  message(glue("Sampling scorelines for season: {season_int}/{season_int+1}"))
+  
+  all_predictions[[as.character(season_int)]] <- 
+    all_predictions[[as.character(season_int)]] %>%
+    rowwise() %>%
+    mutate(
+      sim_result = sample_result(p_H, p_D, p_A),
+      sim_score  = sample_score(sim_rank_home, sim_rank_away, sim_result, score_dist),
+      sim_home_goals = as.numeric(sub("-.*", "", sim_score)),
+      sim_away_goals = as.numeric(sub(".*-", "", sim_score))
+    ) %>%
+    ungroup()
+}
+```
+# Simulating seasons
+
+```{r}
+full_season_simulation <- function(
+  season_int,
+  fixtures,
+  historical_matches,
+  season_tables,
+  fitted_bn,
+  cpt,
+  score_dist,
+  initial_elo,
+  k_factor = 20
+) {
+  
+  matches_per_gameweek <- 10
+  
+  # --- INITIAL STATE ---
+  
+  teams <- unique(c(fixtures$home_team, fixtures$away_team))
+  
+  current_table <- data.frame(
+    team = teams,
+    points = 0,
+    goals_for = 0,
+    goals_against = 0,
+    goal_difference = 0
+  )
+  
+  current_elo <- initial_elo
+  current_elo <- setNames(initial_elo$elo, initial_elo$team)
+
+  simulated_results <- data.frame(
+    home_team   = character(),
+    away_team   = character(),
+    gameweek    = integer(),
+    home_goals  = numeric(),
+    away_goals  = numeric(),
+    sim_result  = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  # --- LOOP OVER GAMEWEEKS ---
+  
+  for (gw in sort(unique(fixtures$gameweek))) {
+    
+    gw_matches <- fixtures[fixtures$gameweek == gw, ]
+    
+    # --- BUILD STANDINGS ---
+    
+    current_table <- current_table %>%
+      mutate(
+        gameweek = gw,
+        projected_goal_difference = round(goal_difference / gw * 38, 0)
+      )
+    
+    # --- EXPECTED POINTS ---
+    
+    # Add ELO
+    current_table$elo <- current_elo[current_table$team]
+    
+    # Add gameweek
+    current_table$gameweek <- gw
+    
+    # Add position
+    current_table <- current_table %>%
+      arrange(desc(points), desc(goal_difference)) %>%
+      mutate(position = row_number())
+    
+    standings_with_exp <- add_exp_points_to_standings(
+      results = simulated_results,
+      standings_by_gw = current_table,
+      season_points = season_tables,
+      compute_component1_mean = compute_component1_mean,
+      cur_season = season_int,
+      matches_per_gameweek = matches_per_gameweek
+    )
+    
+    names(standings_with_exp)[names(standings_with_exp) == "Mean"] <- "current_exp_points"
+    
+    # --- DISCRETISE FEATURES ---
+    
+    standings_with_exp <- discretise_features(standings_with_exp)
+    
+    standings_with_exp$current_exp_points_bin <- cut(
+      standings_with_exp$current_exp_points,
+      breaks = quantile(
+        standings_with_exp$current_exp_points,
+        probs = c(0, .33, .66, 1),
+        na.rm = TRUE
+      ),
+      include.lowest = TRUE,
+      labels = c("Low", "Med", "High")
+    )
+    
+    # --- MERGE FEATURES INTO MATCHES ---
+    
+    gw_matches <- gw_matches %>%
+      left_join(
+        standings_with_exp %>%
+          dplyr::select(team, goal_difference_bin, elo_bin, current_exp_points_bin) %>%
+          rename(
+            home_team = team,
+            home_goal_difference_bin = goal_difference_bin,
+            home_elo_bin = elo_bin,
+            home_current_exp_points_bin = current_exp_points_bin
+          ),
+        by = "home_team"
+      ) %>%
+      left_join(
+        standings_with_exp %>%
+          dplyr::select(team, goal_difference_bin, elo_bin, current_exp_points_bin) %>%
+          rename(
+            away_team = team,
+            away_goal_difference_bin = goal_difference_bin,
+            away_elo_bin = elo_bin,
+            away_current_exp_points_bin = current_exp_points_bin
+          ),
+        by = "away_team"
+      )
+    
+    # --- PREDICT ---
+    
+    gw_preds <- predict_fixtures(
+      fixtures_df = gw_matches,
+      fitted_bn = fitted_bn,
+      match_cpt = cpt
+    )
+    
+    # --- SAMPLE RANKS ---
+    
+    gw_preds <- gw_preds %>%
+      rowwise() %>%
+      mutate(
+        sim_rank_home = {
+          rd <- get_rank_dist(
+            fitted_bn,
+            evidence_list = list(
+              elo_bin = home_elo_bin,
+              goal_difference_bin = home_goal_difference_bin,
+              current_exp_points_bin = home_current_exp_points_bin
+            )
+          )
+          as.integer(sample(names(rd), 1, prob = rd))
+        },
+        sim_rank_away = {
+          rd <- get_rank_dist(
+            fitted_bn,
+            evidence_list = list(
+              elo_bin = away_elo_bin,
+              goal_difference_bin = away_goal_difference_bin,
+              current_exp_points_bin = away_current_exp_points_bin
+            )
+          )
+          as.integer(sample(names(rd), 1, prob = rd))
+        }
+      ) %>%
+      ungroup()
+    
+    # --- SIMULATE SCORES ---
+    
+    gw_preds <- gw_preds %>%
+      rowwise() %>%
+      mutate(
+        sim_result = sample_result(p_H, p_D, p_A),
+        sim_score  = sample_score(sim_rank_home, sim_rank_away, sim_result, score_dist),
+        home_goals = as.numeric(sub("-.*", "", sim_score)),
+        away_goals = as.numeric(sub(".*-", "", sim_score))
+      ) %>%
+      ungroup()
+    
+    # --- UPDATE TABLE ---
+    
+    for (i in 1:nrow(gw_preds)) {
+      
+      h <- gw_preds$home_team[i]
+      a <- gw_preds$away_team[i]
+      
+      hg <- gw_preds$home_goals[i]
+      ag <- gw_preds$away_goals[i]
+      
+      # goals
+      current_table$goals_for[current_table$team == h] <- current_table$goals_for[current_table$team == h] + hg
+      current_table$goals_against[current_table$team == h] <- current_table$goals_against[current_table$team == h] + ag
+      
+      current_table$goals_for[current_table$team == a] <- current_table$goals_for[current_table$team == a] + ag
+      current_table$goals_against[current_table$team == a] <- current_table$goals_against[current_table$team == a] + hg
+      
+      # points
+      if (hg > ag) {
+        current_table$points[current_table$team == h] <- current_table$points[current_table$team == h] + 3
+      } else if (hg < ag) {
+        current_table$points[current_table$team == a] <- current_table$points[current_table$team == a] + 3
+      } else {
+        current_table$points[current_table$team == h] <- current_table$points[current_table$team == h] + 1
+        current_table$points[current_table$team == a] <- current_table$points[current_table$team == a] + 1
+      }
+      
+      # --- UPDATE ELO ---
+      
+      home_advantage <- 60
+      
+      expected_home <- 1 / (1 + 10 ^ ((current_elo[a] - (current_elo[h] + home_advantage)) / 400))
+      
+      actual_home <- ifelse(hg > ag, 1, ifelse(hg == ag, 0.5, 0))
+      
+      new_home <- current_elo[h] + k_factor * (actual_home - expected_home)
+      new_away <- current_elo[a] + k_factor * ((1 - actual_home) - (1 - expected_home))
+      
+      current_elo[h] <- new_home
+      current_elo[a] <- new_away
+    }
+    
+    # recompute GD
+    current_table$goal_difference <- current_table$goals_for - current_table$goals_against
+    
+    # store results
+    simulated_results <- rbind(simulated_results, gw_preds)
+  }
+  
+  # --- FINAL TABLE ---
+  
+  final_table <- current_table %>%
+    arrange(desc(points), desc(goal_difference))
+  
+  final_table$position <- seq_len(nrow(final_table))
+  
+  return(final_table)
+}
+```
+
+# Multiple simulations for 2024
+
+```{r}
+set.seed(12345)
+n_sims <- 500
+
+sim_tables <- lapply(1:n_sims, function(i) {
+  
+  message(glue("Running simulation ", i, " for season {season_int}/{season_int + 1}"))
+  
+  tmp_sim <- full_season_simulation(
+    season_int = 2024,
+    historical_matches = historical_matches,
+    season_tables = season_tables,
+    fitted_bn = fitted_custom,
+    cpt = cpt_wide,
+    score_dist = score_dist,
+    initial_elo = initial_elo_24,
+    fixtures = fixtures_2024,
+    k_factor = 20
+  )
+})
+
+# Combine simulations
+all_results <- do.call(rbind, 
+  lapply(seq_along(sim_tables), function(i) {
+    table <- sim_tables[[i]]
+    table$simulation <- i
+    table
+  })
+)
+
+final_simulation <- aggregate(
+  cbind(points, goal_difference, position) ~ team,
+  data = all_results,
+  FUN = mean
+)
+
+colnames(final_simulation) <- c(
+  "team",
+  "avg_points",
+  "avg_gd",
+  "avg_position"
+)
+
+# Sort by expected strength
+final_simulation <- final_simulation[
+  order(-final_simulation$avg_points, -final_simulation$avg_gd),
+]
+
+# Add expected league position
+final_simulation$position <- seq_len(nrow(final_simulation))
+
+rownames(final_simulation) <- NULL
+
+# Merge on true table
+simulation_vs_actual <- final_simulation %>%
+  rename(sim_position = position) %>%
+  left_join(season_tables[season_tables$season == 2024,] 
+            %>% dplyr::select(team,position) 
+            %>% rename(actual_position = position), 
+            by = c("team"))
+```
+
+# Champions, top 4, and relegation probabilities under the simulations
+
+```{r}
+sim_probabilities <- all_results %>%
+  group_by(team) %>%
+  summarise(
+    P_title = mean(position == 1),
+    P_top4 = mean(position <= 4),
+    P_relegation = mean(position >= 18),
+    avg_position = mean(position)
+  ) %>%
+  arrange(avg_position)
+```
+
+# 7. Testing / validating predictions
+
+# Getting current season results
+
+```{r}
+# Merge current results with predictions
+
+current_gameweek_predictions <- current_gameweek_predictions %>%
+  left_join(results_2526 %>% dplyr::select(home_team, away_team, result),
+            by = c("home_team", "away_team"))
+
+current_season_predictions <- all_predictions$`2024` %>%
+  left_join(results_2526 %>% dplyr::select(home_team, away_team, result),
+            by = c("home_team", "away_team"))
+```
+
+```{r}
+# Extract predicted probabilities
+pmat_current <- as.matrix(current_gameweek_predictions[, c("p_H", "p_D", "p_A")])
+
+# Convert observed factor/char to ordered integers
+obs_vec_current <- match(current_gameweek_predictions$result, c("H", "D", "A"))
+
+rps_values_current <- rps(obs = obs_vec_current, pred = pmat_current)
+```
+
+# Pi-Football predictions
+
+```{r}
+# -------------------
+# Pi football 2010/11
+# -------------------
+
+# Loading in predictions from the pi-football model
+pi_foot_predictions1011 <- read.csv("Data/pifootball_predictions_1011.csv")
+
+pi_foot_predictions1011[,c("p_H", "p_D","p_A")] <- pi_foot_predictions1011[,c("p_H", "p_D","p_A")] / 100
+
+# Extract predicted probabilities
+pmat_pifoot1011 <- as.matrix(pi_foot_predictions1011[, c("p_H", "p_D", "p_A")])
+
+# Convert observed factor/char to ordered integers
+obs_vec_pifoot1011 <- match(pi_foot_predictions1011$result, c("H", "D", "A"))
+
+rps_values_pifoot1011 <- rps(obs = obs_vec_pifoot1011, pred = pmat_pifoot1011)
+
+
+# -------------------
+# Pi football 2011/12
+# -------------------
+
+# Loading in predictions from the pi-football model
+pi_foot_predictions1112 <- read.csv("Data/pifootball_predictions_1112.csv")
+
+pi_foot_predictions1112[,c("p_H", "p_D","p_A")] <- pi_foot_predictions1112[,c("p_H", "p_D","p_A")] / 100
+
+# Extract predicted probabilities
+pmat_pifoot1112 <- as.matrix(pi_foot_predictions1112[, c("p_H", "p_D", "p_A")])
+
+# Convert observed factor/char to ordered integers
+obs_vec_pifoot1112 <- match(pi_foot_predictions1112$result, c("H", "D", "A"))
+
+rps_values_pifoot1112 <- rps(obs = obs_vec_pifoot1112, pred = pmat_pifoot1112)
+```
+
+```{r}
+rps_values_pifoot1011$rps
+rps_values_pifoot1112$rps
+```
+
+# 7.2 Calculating RPS for each season
+
+```{r}
+# Generating RPS values for each season
+
+pmat_list <- list()
+obs_vec_list <- list()
+rps_values_list <- list()
+
+for (season_int in 2000:2024){
+  
+  pmat_list[[as.character(season_int)]] <- as.matrix(
+    all_predictions[[as.character(season_int)]][, c("p_H", "p_D", "p_A")]
+  )
+  
+  obs_vec_list[[as.character(season_int)]] <- match(
+    all_predictions[[as.character(season_int)]]$result, c("H", "D", "A")
+  )
+  
+  rps_values_list[[as.character(season_int)]] <- rps(
+    obs = obs_vec_list[[as.character(season_int)]], pred = pmat_list[[as.character(season_int)]]
+  )$rps
+
+}
+
+# Converting into dataframe
+rps_values <- data.frame(
+  season = names(rps_values_list),
+  rps     = unlist(rps_values_list)
+)
+
+# Adding reference row for pi football value
+rps_values[nrow(rps_values) + 1,] = c("2010_pifootball", rps_values_pifoot1011$rps)
+rps_values[nrow(rps_values) + 1,] = c("2011_pifootball", rps_values_pifoot1112$rps)
+```
+
+# Cumulative gameweek comparison with pi-football
+
+```{r, warning=FALSE}
+rps_calc <- function(obs_i, pred_row) {
+  verification::rps(obs = obs_i, pred = matrix(pred_row, nrow = 1))$rps
+}
+
+pmat_1011 <- pmat_list[["2010"]]
+obs_vec_1011 <- obs_vec_list[["2010"]]
+predictions1011 <- all_predictions[["2010"]]
+
+pmat_1112 <- pmat_list[["2011"]]
+obs_vec_1112 <- obs_vec_list[["2011"]]
+predictions1112 <- all_predictions[["2011"]]
+
+temp_rps_A <- sapply(seq_len(nrow(pmat_1011)), function(i) rps_calc(obs_vec_1011[i], pmat_1011[i, ]))
+temp_rps_B <- sapply(seq_len(nrow(pmat_pifoot1011)), function(i) rps_calc(obs_vec_pifoot1011[i], pmat_pifoot1011[i, ]))
+
+rps_df_1011 <- data.frame(
+  match_id = predictions1011$match_id,
+  date = predictions1011$date,
+  home = predictions1011$home_team, 
+  away = predictions1011$away_team,
+  rps_challenger = temp_rps_A,
+  rps_pifoot = temp_rps_B
+) %>%
+  mutate(
+    rps_diff = temp_rps_B - temp_rps_A,      # positive => B worse than A
+    cum_diff = cumsum(rps_diff)    # cumulative difference across matches
+  )
+
+temp_rps_A <- sapply(seq_len(nrow(pmat_1112)), function(i) rps_calc(obs_vec_1112[i], pmat_1112[i, ]))
+temp_rps_B <- sapply(seq_len(nrow(pmat_pifoot1112)), function(i) rps_calc(obs_vec_pifoot1112[i], pmat_pifoot1112[i, ]))
+
+rps_df_1112 <- data.frame(
+  match_id = predictions1112$match_id,
+  date = predictions1112$date,
+  home = predictions1112$home_team, 
+  away = predictions1112$away_team,
+  rps_challenger = temp_rps_A,
+  rps_pifoot = temp_rps_B
+) %>%
+  mutate(
+    rps_diff = temp_rps_B - temp_rps_A,      # positive -> B worse than A
+    cum_diff = cumsum(rps_diff)    # cumulative difference across matches
+  )
+
+rps_df_1011$season <- "2010/11"
+rps_df_1112$season <- "2011/12"
+
+rps_long_combined <- rbind(rps_df_1011, rps_df_1112)
+
+p_combined_pifoot <- ggplot(rps_long_combined, aes(x = match_id, y = cum_diff)) +
+  geom_line(size = 1) +
+  geom_point(size = 0.6, alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~season, ncol = 2, scales = "fixed") + 
+  labs(
+    title = "Cumulative Difference in Per-Match RPS (Pi-Football − Challenger)",
+    subtitle = "Positive values indicate the proposed model outperforms Pi-Football",
+    x = "Match ID (1–380)",
+    y = "Cumulative RPS Difference"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 12, face = "bold")
+  )
+
+p_combined_pifoot
+```
+
+# Plotting the average RPS values across seasons
+
+```{r}
+rps_long_filtered <- rps_long %>%
+  dplyr::filter(model != "rps_SL")
+
+means_df_filtered <- means_df %>%
+  dplyr::filter(model != "rps_SL")
+
+rps_long_run_plot <- ggplot(rps_long_filtered[1:25,], 
+       aes(x = season, y = rps, color = model, group = model)) +
+  geom_line() +
+  geom_point() +
+
+  geom_hline(data = means_df_filtered,
+             aes(yintercept = mean_rps, color = model),
+             linetype = "dashed") +
+  
+  geom_point(
+    data = data.frame(
+      season = c("2010", "2011"),
+      rps = c(
+        rps_long[rps_long$season == "2010_pifootball",]$rps[1],
+        rps_long[rps_long$season == "2011_pifootball",]$rps[1]
+      ),
+      model = "Pi Football"
+    ),
+    aes(x = season, y = rps, color = model),
+    size = 2
+  ) +
+
+  labs(
+    title = "RPS Values Across Seasons 2000/01 - 2024/25",
+    x = "Season Start Year",
+    y = "RPS"
+  ) +
+  scale_color_manual(
+    values = c(
+      "rps" = "#F8766D",  
+      "Pi Football" = "#00BFC4"
+    ),
+    labels = c(
+      "rps" = "Expert Model",
+      "Pi Football" = "Pi Football"
+    )
+  ) +
+  labs(colour = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+rps_long_run_plot
+```
+
+
+## Full DAG for completeness
+
+```{r}
+# Final BN
+
+full_network_string <- paste0(
+  # Home side latent performance factors
+  "[Current_Exp_Points_home][GoalDiff_home][Elo_home][RecentForm_home][DaysRest_home]",
+  "[HomeRank|Current_Exp_Points_home:GoalDiff_home:Elo_home]",
+  "[ExpectedPerformance_home|HomeRank:DaysRest_home:RecentForm_home]",
+  
+  # Away side latent performance factors
+  "[Current_Exp_Points_away][GoalDiff_away][Elo_away][RecentForm_away][DaysRest_away]",
+  "[AwayRank|Current_Exp_Points_away:GoalDiff_away:Elo_away]",
+  "[ExpectedPerformance_away|AwayRank:DaysRest_away:RecentForm_away]",
+  
+  # Match-level contextual variable
+  "[HomeAdvantage]",
+  
+  # Outcome
+  "[MatchResult|ExpectedPerformance_home:ExpectedPerformance_away:HomeAdvantage]"
+)
+
+full_dag <- model2network(full_network_string)
+
+graphviz.plot(full_dag)
+
+full_dag <- model2network(full_network_string)
+
+graphviz.plot(full_dag)
+```
+
+## Variance curves for appendix
+
+```{r}
+# Plot 1: Previous seasons variance
+p1 <- ggplot(df_prev, aes(x = season, y = variance)) +
+  geom_line(size = 1) +
+  labs(
+    x = "Preceding season",
+    y = "Variance"
+  ) +
+  theme_minimal()
+
+# Plot 2: Current season variance
+p2 <- ggplot(df_cur, aes(x = matches, y = variance)) +
+  geom_line(size = 1) +
+  labs(
+    x = "Gameweek",
+    y = "Variance"
+  ) +
+  theme_minimal()
+
+# Combine
+p1 + p2
+
+ggsave("variance_curves.png", width = 12, height = 4)
+```
+

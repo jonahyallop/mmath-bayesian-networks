@@ -1,0 +1,177 @@
+---
+title: "Causality"
+author: "Jonah Yallop"
+date: "2026-03-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Get and subset data
+
+```{r}
+# Install if needed
+# install.packages("bartcs")
+
+data(ihdp, package = "bartcs")
+
+# Select only a few variables for analysis
+# X1 - X3 confounders, X5 a mediator
+ihdp_small <- ihdp[, c("treatment", "y_factual", "X3", "X2", "X6", "X1")]
+
+# Rename columns
+colnames(ihdp_small) <- c(
+  "Treatment", "Outcome",
+  "X1", "X2", "X3", "X4"
+)
+
+# Convert Treatment to factor
+ihdp_small$Treatment <- as.factor(ihdp_small$Treatment)
+
+# Discretise for BN (3 levels)
+ihdp_disc <- discretize(ihdp_small, method = "quantile", breaks = 5)
+
+# Rename bins
+levels(ihdp_disc$Outcome) <- c("Low", "Medium-Low", "Medium", "Medium-High", "High")
+levels(ihdp_disc$X1) <- c("Low", "Medium-Low", "Medium", "Medium-High", "High")
+levels(ihdp_disc$X2) <- c("Low", "Medium-Low", "Medium", "Medium-High", "High")
+levels(ihdp_disc$X3) <- c("Low", "Medium-Low", "Medium", "Medium-High", "High")
+levels(ihdp_disc$X4) <- c("Low", "Medium-Low", "Medium", "Medium-High", "High")
+
+ihdp_disc$Treatment <- factor(
+  ihdp_disc$Treatment,
+  levels = c(0, 1),
+  labels = c("Control", "Treated")
+)
+```
+
+# 2. Build a causal DAG and fit a BN
+
+```{r}
+# Define a simple DAG for analysis
+dag <- model2network("[X1][X2][X3][Treatment|X1:X2:X3][X4|Treatment][Outcome|Treatment:X1:X2:X3:X4]")
+
+graphviz.plot(dag)
+
+# Fit the BN
+fit <- bn.fit(dag, data = ihdp_disc)
+```
+# 3. Compute observational probabilities
+
+```{r}
+set.seed(7)
+
+obs_high_t <- cpquery(
+  fit,
+  event = (Outcome == "High"),
+  evidence = list(Treatment = "Treated"),
+  method = "lw",
+  n = 5000
+)
+
+obs_med_t <- cpquery(
+  fit,
+  event = (Outcome == "Medium"),
+  evidence = list(Treatment = "Treated"),
+  method = "lw",
+  n = 5000
+)
+
+obs_low_t <- cpquery(
+  fit,
+  event = (Outcome == "Low"),
+  evidence = list(Treatment = "Treated"),
+  method = "lw",
+  n = 5000
+)
+
+obs_high_c <- cpquery(
+  fit,
+  event = (Outcome == "High"),
+  evidence = list(Treatment = "Control"),
+  method = "lw",
+  n = 5000
+)
+
+obs_med_c <- cpquery(
+  fit,
+  event = (Outcome == "Medium"),
+  evidence = list(Treatment = "Control"),
+  method = "lw",
+  n = 5000
+)
+
+obs_low_c <- cpquery(
+  fit,
+  event = (Outcome == "Low"),
+  evidence = list(Treatment = "Control"),
+  method = "lw",
+  n = 5000
+)
+
+obs_high_t
+obs_med_t
+obs_low_t
+
+obs_high_c
+obs_med_c
+obs_low_c
+```
+
+# 4. Compute interventional probabilities
+
+```{r}
+set.seed(40)
+# Estimate P(Y | do(T=1)) via adjustment
+do_estimates <- c()
+
+treatment_sum <- 0
+
+for(i in 1:1000){
+  sample_row <- ihdp_disc[sample(nrow(ihdp_disc), 1), ]
+  
+  if (sample_row$Treatment == "Treated") {
+   treatment_sum <- treatment_sum + 1
+  }
+  
+  prob <- cpquery(
+    fit,
+    event = (Outcome == "High"),
+    evidence = list(
+      Treatment = "Treated",
+      X1 = sample_row$X1,
+      X2 = sample_row$X2,
+      X3 = sample_row$X3
+    ),
+    method = "lw"
+  )
+  
+  do_estimates <- c(do_estimates, prob)
+}
+
+do_treated <- mean(do_estimates, na.rm = TRUE)
+do_treated
+```
+
+```{r}
+bias <- obs_high_t - do_treated
+bias
+```
+
+# Checking individual effect
+
+```{r}
+i <- 
+
+observed <- ihdp$y_factual[i]
+counterfactual <- ihdp$y_cfactual[i]
+treatment_given <- ihdp$treatment[i]
+
+individual_effect <- observed - counterfactual
+
+individual_effect
+treatment_given
+```
+

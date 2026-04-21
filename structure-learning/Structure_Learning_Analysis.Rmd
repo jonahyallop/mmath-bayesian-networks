@@ -1,0 +1,549 @@
+---
+title: "Structure Learning Analysis"
+author: "Jonah Yallop"
+date: "2026-02-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(bnlearn)
+library(Rgraphviz)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(gtools)
+```
+
+# Load in networks
+
+```{r}
+alarm_fit <- read.bif("alarm.bif")
+alarm_bn <- bn.net(alarm_fit)
+
+andes_fit <- read.bif("andes.bif")
+andes_bn <- bn.net(andes_fit)
+
+water_fit <- read.bif("water.bif")
+water_bn <- bn.net(water_fit)
+
+insurance_fit <- read.bif("insurance.bif")
+insurance_bn <- bn.net(insurance_fit)
+```
+
+# Define some standard parameters across tests
+
+```{r}
+sample_sizes = c(200, 500, 1000, 2000, 3000, 4000, 5000)
+alphas = alphas <- c(0.001, 0.01, 0.05, 0.1)
+scores = c("aic", "bic")
+```
+
+# 1. Run Sensitivity Testing
+
+```{r, warning=FALSE}
+# 1. Alpha sensitivity testing for PC and MMHC
+
+# ALARM network
+
+alpha_sensitivity_pc_alarm <- run_alpha_sensitivity_tests(
+  network = alarm_fit,
+  sample_sizes = sample_sizes,
+  alphas = alphas,
+  R = 25,
+  test = "mi",
+  max.sx = 3,
+  seed_offset = 200,
+  algorithm = "PC"
+)
+
+alpha_sensitivity_mmhc_alarm <- run_alpha_sensitivity_tests(
+  network = alarm_fit,
+  sample_sizes = sample_sizes,
+  alphas = alphas,
+  R = 25,
+  test = "mi",
+  max.sx = 3,
+  seed_offset = 200,
+  algorithm = "MMHC"
+)
+
+# INSURANCE network
+
+alpha_sensitivity_pc_insurance <- run_alpha_sensitivity_tests(
+  network = insurance_fit,
+  sample_sizes = sample_sizes,
+  alphas = alphas,
+  R = 25,
+  test = "mi",
+  max.sx = 3,
+  seed_offset = 200,
+  algorithm = "PC"
+)
+
+alpha_sensitivity_mmhc_insurance <- run_alpha_sensitivity_tests(
+  network = insurance_fit,
+  sample_sizes = sample_sizes,
+  alphas = alphas,
+  R = 25,
+  test = "mi",
+  max.sx = 3,
+  seed_offset = 200,
+  algorithm = "MMHC"
+)
+
+# WATER network
+
+alpha_sensitivity_pc_water <- run_alpha_sensitivity_tests(
+  network = water_fit,
+  sample_sizes = sample_sizes,
+  alphas = alphas,
+  R = 25,
+  test = "mi",
+  max.sx = 3,
+  seed_offset = 200,
+  algorithm = "PC"
+)
+
+alpha_sensitivity_mmhc_water <- run_alpha_sensitivity_tests(
+  network = water_fit,
+  sample_sizes = sample_sizes,
+  alphas = alphas,
+  R = 25,
+  test = "mi",
+  max.sx = 3,
+  seed_offset = 200,
+  algorithm = "MMHC"
+)
+
+# ANDES network
+
+alpha_sensitivity_pc_andes <- run_alpha_sensitivity_tests(
+  network = andes_fit,
+  sample_sizes = sample_sizes,
+  alphas = alphas,
+  R = 3,
+  test = "mi",
+  max.sx = 3,
+  seed_offset = 200,
+  algorithm = "PC"
+)
+
+alpha_sensitivity_mmhc_andes <- run_alpha_sensitivity_tests(
+  network = andes_fit,
+  sample_sizes = sample_sizes,
+  alphas = alphas,
+  R = 10,
+  test = "mi",
+  max.sx = 3,
+  seed_offset = 200,
+  algorithm = "MMHC"
+)
+```
+
+
+```{r, warning=FALSE}
+# 2. Objective function sensitivity for HC and MMHC
+
+# ALARM network
+
+objective_sensitivity_hc_alarm <- run_objective_sensitivity_tests(
+  network = alarm_fit,
+  sample_sizes = sample_sizes,
+  scores = scores,
+  restart = 0,
+  perturb = 1,
+  algorithm = "HC"
+)
+
+objective_sensitivity_mmhc_alarm <- run_objective_sensitivity_tests(
+  network = alarm_fit,
+  sample_sizes = sample_sizes,
+  scores = scores,
+  restart = 0,
+  perturb = 1,
+  algorithm = "MMHC"
+)
+
+# INSURANCE network
+
+objective_sensitivity_hc_insurance <- run_objective_sensitivity_tests(
+  network = insurance_fit,
+  sample_sizes = sample_sizes,
+  scores = scores,
+  restart = 0,
+  perturb = 1,
+  algorithm = "HC"
+)
+
+objective_sensitivity_mmhc_insurance <- run_objective_sensitivity_tests(
+  network = insurance_fit,
+  sample_sizes = sample_sizes,
+  scores = scores,
+  restart = 0,
+  perturb = 1,
+  algorithm = "MMHC"
+)
+
+# WATER network
+
+objective_sensitivity_hc_water <- run_objective_sensitivity_tests(
+  network = water_fit,
+  sample_sizes = sample_sizes,
+  scores = scores,
+  restart = 0,
+  perturb = 1,
+  algorithm = "HC"
+)
+
+objective_sensitivity_mmhc_water <- run_objective_sensitivity_tests(
+  network = water_fit,
+  sample_sizes = sample_sizes,
+  scores = scores,
+  restart = 0,
+  perturb = 1,
+  algorithm = "MMHC"
+)
+
+# ANDES network
+
+objective_sensitivity_hc_andes <- run_objective_sensitivity_tests(
+  network = andes_fit,
+  sample_sizes = sample_sizes,
+  scores = scores,
+  restart = 0,
+  perturb = 1,
+  algorithm = "HC"
+)
+
+objective_sensitivity_mmhc_andes <- run_objective_sensitivity_tests(
+  network = andes_fit,
+  sample_sizes = sample_sizes,
+  scores = scores,
+  restart = 0,
+  perturb = 1,
+  algorithm = "MMHC"
+)
+```
+
+# Algorithm performance comparisons
+
+Plan is to run 30 repeats for each network for each algorithm. Then average normalised SHD, precision and recall over the repeats.
+
+```{r, warning=FALSE}
+# MMHC performance
+
+mmhc_performance_alarm <- run_mmhc_replicates(
+  alarm_fit,
+  sample_n = 5000,
+  R = 30,
+  score = "bic",
+  test = "mi",
+  alpha = 0.05
+)
+
+mmhc_performance_insurance <- run_mmhc_replicates(
+  insurance_fit,
+  sample_n = 5000,
+  R = 30,
+  score = "bic",
+  test = "mi",
+  alpha = 0.05
+)
+
+mmhc_performance_water <- run_mmhc_replicates(
+  water_fit,
+  sample_n = 5000,
+  R = 30,
+  score = "bic",
+  test = "mi",
+  alpha = 0.05
+)
+
+mmhc_performance_andes <- run_mmhc_replicates(
+  andes_fit,
+  sample_n = 5000,
+  R = 30,
+  score = "bic",
+  test = "mi",
+  alpha = 0.05
+)
+
+# HC performance
+
+# ALARM
+hc_performance_alarm <- run_hc_replicates(
+  alarm_fit,
+  sample_n = 5000,
+  R = 30,
+  score = "bic"
+)
+
+# INSURANCE
+hc_performance_insurance <- run_hc_replicates(
+  insurance_fit,
+  sample_n = 5000,
+  R = 30,
+  score = "bic"
+)
+
+# WATER
+hc_performance_water <- run_hc_replicates(
+  water_fit,
+  sample_n = 5000,
+  R = 30,
+  score = "bic"
+)
+
+# ANDES
+hc_performance_andes <- run_hc_replicates(
+  andes_fit,
+  sample_n = 5000,
+  R = 30,
+  score = "bic"
+)
+
+# PC performance
+
+# ALARM
+pc_performance_alarm <- run_pc_replicates(
+  alarm_fit,
+  sample_n = 5000,
+  R = 30,
+  test = "mi",
+  alpha = 0.05
+)
+
+# INSURANCE
+pc_performance_insurance <- run_pc_replicates(
+  insurance_fit,
+  sample_n = 5000,
+  R = 30,
+  test = "mi",
+  alpha = 0.05
+)
+
+# WATER
+pc_performance_water <- run_pc_replicates(
+  water_fit,
+  sample_n = 5000,
+  R = 30,
+  test = "mi",
+  alpha = 0.05
+)
+
+# ANDES
+pc_performance_andes <- run_pc_replicates(
+  andes_fit,
+  sample_n = 5000,
+  R = 30,
+  test = "mi",
+  alpha = 0.05
+)
+```
+
+```{r}
+# Combining results into algorithm level dataframes
+
+combined_pc_performance <- bind_rows(
+  pc_performance_alarm$summary %>% mutate(network = "ALARM"),
+  pc_performance_insurance$summary %>% mutate(network = "INSURANCE"),
+  pc_performance_water$summary %>% mutate(network = "WATER"),
+  pc_performance_andes$summary %>% mutate(network = "ANDES")
+)
+
+combined_hc_performance <- bind_rows(
+  hc_performance_alarm$summary %>% mutate(network = "ALARM"),
+  hc_performance_insurance$summary %>% mutate(network = "INSURANCE"),
+  hc_performance_water$summary %>% mutate(network = "WATER"),
+  hc_performance_andes$summary %>% mutate(network = "ANDES")
+)
+
+combined_mmhc_performance <- bind_rows(
+  mmhc_performance_alarm$summary %>% mutate(network = "ALARM"),
+  mmhc_performance_insurance$summary %>% mutate(network = "INSURANCE"),
+  mmhc_performance_water$summary %>% mutate(network = "WATER"),
+  mmhc_performance_andes$summary %>% mutate(network = "ANDES")
+)
+
+combined_algorithms <- bind_rows(
+  combined_mmhc_performance %>% mutate(algorithm = "MMHC"),
+  combined_hc_performance %>% mutate(algorithm = "HC"),
+  combined_pc_performance %>% mutate(algorithm = "PC")
+)
+```
+
+```{r}
+# Comparison values
+
+mean_norm_shd_mmhc <- mean(combined_mmhc_performance$normalized_by_true)
+mean_norm_shd_hc <- mean(combined_hc_performance$normalized_by_true)
+mean_norm_shd_pc <- mean(combined_pc_performance$normalized_by_true)
+
+mean_precision_mmhc <- mean(combined_mmhc_performance$precision)
+mean_precision_hc <- mean(combined_hc_performance$precision)
+mean_precision_pc <- mean(combined_pc_performance$precision)
+
+mean_recall_mmhc <- mean(combined_mmhc_performance$recall)
+mean_recall_hc <- mean(combined_hc_performance$recall)
+mean_recall_pc <- mean(combined_pc_performance$recall)
+```
+
+```{r}
+mean_norm_shd_hc
+mean_norm_shd_pc
+mean_norm_shd_mmhc
+
+mean_precision_hc
+mean_precision_pc
+mean_precision_mmhc
+
+mean_recall_hc
+mean_recall_pc
+mean_recall_mmhc
+```
+
+# Structural error decomposition
+
+Splitting SHD values into structural and directional
+
+```{r}
+structural_decomp_df <- combined_algorithms %>%
+  group_by(network, algorithm) %>%
+  summarise(
+    mean_norm_full_shd = mean(normalized_by_true, na.rm = TRUE),
+    sd_shd = sd(normalized_by_true, na.rm = TRUE),
+    mean_norm_skeleton_shd = mean(normalized_skeleton_shd, na.rm = TRUE),
+    sd_skeleton_shd = sd(normalized_skeleton_shd, na.rm = TRUE),
+    mean_norm_orientation_shd = mean(normalized_orientation, na.rm = TRUE),
+    sd_orientation_shd = sd(normalized_orientation, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+# Edge recovery frequency analysis
+
+```{r}
+# Edge recovery across replicates
+efreq_mmhc_alarm <- edge_recovery_frequency(alarm_fit, mmhc_performance_alarm$raw)
+names(efreq_mmhc_alarm) <- c("edge", "mmhc_freq", "mmhc_prop")
+
+efreq_hc_alarm <- edge_recovery_frequency(alarm_fit, hc_performance_alarm$raw)
+names(efreq_hc_alarm) <- c("edge", "hc_freq", "hc_prop")
+
+efreq_pc_alarm <- edge_recovery_frequency(alarm_fit, pc_performance_alarm$raw)
+names(efreq_pc_alarm) <- c("edge", "pc_freq", "pc_prop")
+
+most_recovered_edges_mmhc <- efreq_mmhc_alarm[order(-efreq_mmhc_alarm$prop)[1:10], ] # top 10 most often recovered
+least_recovered_edges_mmhc <- efreq_mmhc_alarm[order(efreq_mmhc_alarm$prop)[1:10], ] # top 10 most often recovered
+
+most_recovered_edges_hc <- efreq_hc_alarm[order(-efreq_hc_alarm$prop)[1:10], ] # top 10 most often recovered
+least_recovered_edges_hc <- efreq_hc_alarm[order(efreq_hc_alarm$prop)[1:10], ] # top 10 most often recovered
+```
+
+```{r}
+# Combine results from all algorithms
+combined_edge_frequencies <- efreq_mmhc_alarm %>%
+  left_join(efreq_pc_alarm, by = c("edge")) %>%
+  left_join(efreq_hc_alarm, by = c("edge"))
+
+combined_edge_frequencies <- bind_rows(
+  efreq_pc_alarm %>% mutate(algo = "PC"),
+  efreq_hc_alarm %>% mutate(algo = "HC"),
+  efreq_mmhc_alarm %>% mutate(algo = "MMHC")
+)
+
+combined_edge_frequencies <- combined_edge_frequencies %>% 
+  arrange(desc(hc_freq), desc(mmhc_freq))
+
+edge_bands <- combined_edge_frequencies %>%
+  mutate(
+    pc_band   = assign_band(pc_prop),
+    hc_band   = assign_band(hc_prop),
+    mmhc_band = assign_band(mmhc_prop)
+  )
+
+pc_edge_summary <- edge_bands %>%
+  count(pc_band) %>%
+  mutate(prop = n / sum(n))
+
+hc_edge_summary <- edge_bands %>%
+  count(hc_band) %>%
+  mutate(prop = n / sum(n))
+
+mmhc_edge_summary <- edge_bands %>%
+  count(mmhc_band) %>%
+  mutate(prop = n / sum(n))
+
+edge_summary_table <- full_join(pc_edge_summary, hc_edge_summary, 
+                           by = c("pc_band" = "hc_band")) %>%
+  full_join(mmhc_edge_summary, by = c("pc_band" = "mmhc_band")) %>%
+  rename(
+    band = pc_band,
+    pc_prop = prop.x,
+    hc_prop = prop.y,
+    mmhc_prop = prop
+  )
+
+# Keep top edges (e.g. by average frequency)
+top_edges <- df %>%
+  group_by(edge) %>%
+  summarise(mean_prop = mean(prop)) %>%
+  arrange(desc(mean_prop)) %>%
+  slice(1:12) %>%
+  pull(edge)
+
+df_plot <- df %>% filter(edge %in% top_edges)
+
+ggplot(df_plot, aes(x = reorder(edge, -prop), y = prop, fill = algo)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Edge", y = "Recovery Frequency") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Reverse engineering edge decisions
+
+```{r, warning=FALSE}
+res <- evaluate_pc_once(alarm_fit, data = rbn(alarm_fit, n = 5000), alpha = 0.05)
+
+pc_fit <- res$pc_fit
+```
+
+```{r}
+res_sep <- find_sepset(rbn(alarm_fit, n = 1000), "EXPCO2", "VENTLUNG")
+
+res_sep
+```
+
+## Runtime analysis
+
+```{r}
+hc_water_runtime <- mean(hc_performance_water$summary$runtime_sec)
+hc_insurance_runtime <- mean(hc_performance_insurance$summary$runtime_sec)
+hc_alarm_runtime <- mean(hc_performance_alarm$summary$runtime_sec)
+hc_andes_runtime <- mean(hc_performance_andes$summary$runtime_sec)
+
+pc_water_runtime <- mean(pc_performance_water$summary$runtime_sec)
+pc_insurance_runtime <- mean(pc_performance_insurance$summary$runtime_sec)
+pc_alarm_runtime <- mean(pc_performance_alarm$summary$runtime_sec)
+pc_andes_runtime <- mean(pc_performance_andes$summary$runtime_sec)
+
+mmhc_water_runtime <- mean(mmhc_performance_water$summary$runtime_sec)
+mmhc_insurance_runtime <- mean(mmhc_performance_insurance$summary$runtime_sec)
+mmhc_alarm_runtime <- mean(mmhc_performance_alarm$summary$runtime_sec)
+mmhc_andes_runtime <- mean(mmhc_performance_andes$summary$runtime_sec)
+
+runtime_table <- data.frame(
+  Network = c("ALARM", "INSURANCE", "WATER", "ANDES"),
+  PC      = c(pc_alarm_runtime, pc_insurance_runtime, pc_water_runtime, pc_andes_runtime),
+  HC      = c(hc_alarm_runtime, hc_insurance_runtime, hc_water_runtime, hc_andes_runtime),
+  MMHC    = c(mmhc_alarm_runtime, mmhc_insurance_runtime, mmhc_water_runtime, mmhc_andes_runtime)
+)
+
+runtime_table
+```
+

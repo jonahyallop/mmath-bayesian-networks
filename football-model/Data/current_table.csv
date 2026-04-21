@@ -1,0 +1,21 @@
+position,team,total_points,matches_played,goals_for,goals_against,goal_difference
+1,Arsenal,16,7,14,3,11
+2,Liverpool,15,7,13,9,4
+3,Bournemouth,14,7,11,8,3
+4,Tottenham,14,7,13,5,8
+5,Manchester City,13,7,15,6,9
+6,Crystal Palace,12,7,9,5,4
+7,Chelsea,11,7,13,9,4
+8,Everton,11,7,9,7,2
+9,Sunderland,11,7,7,6,1
+10,Manchester Utd,10,7,9,11,-2
+11,Aston Villa,9,7,6,7,-1
+12,Brighton,9,7,10,10,0
+13,Newcastle Utd,9,7,6,5,1
+14,Fulham,8,7,8,11,-3
+15,Leeds United,8,7,7,11,-4
+16,Brentford,7,7,9,12,-3
+17,Nottingham Forest,5,7,5,12,-7
+18,Burnley,4,7,7,15,-8
+19,West Ham,4,7,6,16,-10
+20,Wolves,2,7,5,14,-9

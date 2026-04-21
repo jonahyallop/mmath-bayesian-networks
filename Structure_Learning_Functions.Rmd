@@ -1,0 +1,614 @@
+---
+title: "Structure Learning Functions"
+author: "Jonah Yallop"
+date: "2026-02-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### 1. Evaluation metric functions
+
+```{r}
+# -----------------------------------------------------------
+# 1. Function to calculate SHD, precision and recall
+
+calculate_evaluation_metrics <- function(true_cpdag, learned_cpdag) {
+  
+  # Get adjacency matrices for learnt and true graphs
+  amat_true <- amat(true_cpdag)
+  amat_learn <- amat(learned_cpdag)
+
+  # Generate adjacency matrices for the skeleton (e.g., undirected)
+  skel_true <- ((amat_true + t(amat_true)) > 0) * 1
+  skel_learn <- ((amat_learn + t(amat_learn)) > 0) * 1
+  
+  # Sum of cases where edge present in on graph but not in the other
+  # Halved due to double count
+  skeleton_shd <- sum(xor(skel_true == 1, skel_learn == 1)) / 2
+  
+  # Skeleton precision and recall
+  TP <- sum((skel_true == 1) & (skel_learn == 1)) / 2
+  FP <- sum((skel_true == 0) & (skel_learn == 1)) / 2
+  FN <- sum((skel_true == 1) & (skel_learn == 0)) / 2
+  precision <- ifelse((TP + FP) == 0, NA, TP / (TP + FP))
+  recall <- ifelse((TP + FN) == 0, NA, TP / (TP + FN))
+  
+  # Calculate full SHD
+  # e.g., including edge directions
+  full_shd <- shd(true_cpdag, learned_cpdag)
+  
+  # Orientation errors relative to directed edges in true CPDAG
+  # reversals, missing edges, undirected edges
+  orientation_errors <- 0
+  n_true_directed <- 0
+  reversal_count <- 0
+  ambiguous_count <- 0
+  missing_count <- 0
+  
+  p <- ncol(amat_true)
+  
+  for (i in 1:p) {
+    for (j in 1:p) {
+      if (i == j) next
+      if (amat_true[i, j] == 1 && amat_true[j, i] == 0) { # true has i -> j
+        n_true_directed <- n_true_directed + 1
+        learned_ij <- amat_learn[i, j]
+        learned_ji <- amat_learn[j, i]
+        if (!(learned_ij == 1 && learned_ji == 0)) { # learnt doesn't have i -> j
+          orientation_errors <- orientation_errors + 1
+          if (learned_ij == 1 && learned_ji == 1) ambiguous_count <- ambiguous_count + 1 # learnt has i -- j
+          else if (learned_ij == 0 && learned_ji == 1) reversal_count <- reversal_count + 1 # learnt has i <- j
+          else if (learned_ij == 0 && learned_ji == 0) missing_count <- missing_count + 1 # learnt has i and j not adjacent
+        }
+      }
+    }
+  }
+  
+  n_true_edges <- sum(skel_true) / 2
+  possible_node_count <- ncol(amat_true) * (ncol(amat_true) - 1) / 2
+  
+  normalized_orientation_shd <- orientation_errors /
+    ifelse(n_true_directed > 0, n_true_directed, 1)
+  
+  return(list(
+    full_shd = full_shd,
+    skeleton_shd = skeleton_shd,
+    orientation_shd = orientation_errors,
+    n_true_directed = n_true_directed, # number of directed edges in true graph
+    reversal_count = reversal_count,
+    ambiguous_count = ambiguous_count,
+    missing_count = missing_count,
+    n_true_edges = n_true_edges, # number of edges in true graph
+    normalized_by_true_edges = full_shd / ifelse(n_true_edges > 0, n_true_edges, 1),
+    normalized_by_possible = full_shd / possible_node_count,
+    precision = precision,
+    recall = recall,
+    normalized_orientation_shd = normalized_orientation_shd,
+    normalized_skeleton_shd = skeleton_shd / ifelse(n_true_edges > 0, n_true_edges, 1)
+  ))
+}
+```
+
+### 2. PC Functions
+
+```{r}
+# -----------------------------------------------------------
+# PC FUNCTIONS
+# -----------------------------------------------------------
+
+# -----------------------------------------------------------
+# Function to run the PC algorithm once
+# -----------------------------------------------------------
+
+evaluate_pc_once <- function(true_bn, data, test = "mi", alpha = 0.05, max.sx = NULL) {
+  
+  # True CPDAG
+  true_graph <- if (inherits(true_bn, "bn.fit")) bn.net(true_bn) else true_bn
+  true_cp <- cpdag(true_graph)
+  
+  # PC run with timing
+  t0 <- proc.time()
+  pc_fit <- tryCatch({
+    if (is.null(max.sx)) {
+      pc.stable(x = data, test = test, alpha = alpha)
+    } else {
+      pc.stable(x = data, test = test, alpha = alpha, max.sx = max.sx)
+    }
+  }, error = function(e) { stop("PC failed: ", e$message) })
+  t1 <- proc.time()
+  runtime_sec <- as.numeric((t1 - t0)["elapsed"])
+  
+  # Calculate SHD, precision, recall, and orientation error counts
+  metrics <- calculate_evaluation_metrics(true_cp, pc_fit)
+  metrics$runtime_sec <- runtime_sec
+  metrics$pc_fit <- pc_fit
+  return(metrics)
+}
+
+# -----------------------------------------------------------
+# Function to run multiple replicates and summarise
+# -----------------------------------------------------------
+
+run_pc_replicates <- function(true_bn,
+                              sample_n = 1000,
+                              R = 30,
+                              test = "mi",
+                              alpha = 0.05,
+                              max.sx = NULL,
+                              seed = 123) {
+  
+  # Seed for reproducibility
+  set.seed(seed)
+  
+  # Initialise results vec
+  results <- vector("list", R)
+  
+  # Sample parameters: if true_bn is bn.fit (has CPTs), use rbn(true_bn)
+  for (r in seq_len(R)) {
+    # Sample from the true network with sample size n
+    data_r <- rbn(true_bn, n = sample_n)
+    # Run the PC algorithm on this sample and store to results vec
+    results[[r]] <- evaluate_pc_once(true_bn, data_r, test = test, alpha = alpha, max.sx = max.sx)
+  }
+  
+  # Summarise results in dataframe
+  df <- do.call(rbind, lapply(results, function(x) {
+    data.frame(
+      full_shd = x$full_shd,
+      skeleton_shd = x$skeleton_shd,
+      orientation_shd = x$orientation_shd,
+      normalized_by_true = x$normalized_by_true_edges,
+      normalized_by_possible = x$normalized_by_possible,
+      normalized_orientation = x$normalized_orientation_shd,
+      normalized_skeleton_shd = x$normalized_skeleton_shd,
+      precision = x$precision,
+      recall = x$recall,
+      runtime_sec = x$runtime_sec,
+      reversal_count = x$reversal_count,
+      ambiguous_count = x$ambiguous_count,
+      missing_count = x$missing_count
+    )
+  }))
+  return(list(raw = results, summary = df))
+}
+```
+
+### 3. HC Functions
+
+```{r}
+# -----------------------------------------------------------
+# HC FUNCTIONS
+# -----------------------------------------------------------
+
+# -----------------------------------------------------------
+# Function to run the HC algorithm once
+# -----------------------------------------------------------
+
+evaluate_hc_once <- function(true_bn, data, score = "bic", restart = 0, perturb = 1) {
+  
+  # True CPDAG
+  true_graph <- if (inherits(true_bn, "bn.fit")) bn.net(true_bn) else true_bn
+  true_cp <- cpdag(true_graph)
+  
+  # HC run with timing
+  t0 <- proc.time()
+  hc_fit <- tryCatch({
+    hc(x = data, score = score, restart = restart, perturb = perturb)
+  }, error = function(e) { stop("HC failed: ", e$message) })
+  t1 <- proc.time()
+  runtime_sec <- as.numeric((t1 - t0)["elapsed"])
+  
+  hc_cp <- cpdag(hc_fit)
+  
+  # Calculate SHD, precision, recall, and orientation error counts
+  metrics <- calculate_evaluation_metrics(true_cp, hc_cp)
+  metrics$runtime_sec <- runtime_sec
+  metrics$pc_fit <- hc_cp
+  return(metrics)
+}
+
+# -----------------------------------------------------------
+# Function to run multiple HC replicates and summarise
+# -----------------------------------------------------------
+
+run_hc_replicates <- function(true_bn,
+                              sample_n = 1000,
+                              R = 30,
+                              score = "bic",
+                              restart = 0,
+                              perturb = 1,
+                              seed = 123) {
+  
+  # Seed for reproducibility
+  set.seed(seed)
+  
+  # Initialise results list
+  results <- vector("list", R)
+  
+  for (r in seq_len(R)) {
+    # Sample from the true network
+    data_r <- rbn(true_bn, n = sample_n)
+    
+    # Run HC and store results
+    results[[r]] <- evaluate_hc_once(
+      true_bn,
+      data_r,
+      score = score,
+      restart = restart,
+      perturb = perturb
+    )
+  }
+  
+  # Summarise results in dataframe
+  df <- do.call(rbind, lapply(results, function(x) {
+    data.frame(
+      full_shd = x$full_shd,
+      skeleton_shd = x$skeleton_shd,
+      orientation_shd = x$orientation_shd,
+      normalized_by_true = x$normalized_by_true_edges,
+      normalized_by_possible = x$normalized_by_possible,
+      normalized_orientation = x$normalized_orientation_shd,
+      normalized_skeleton_shd = x$normalized_skeleton_shd,
+      precision = x$precision,
+      recall = x$recall,
+      runtime_sec = x$runtime_sec,
+      reversal_count = x$reversal_count,
+      ambiguous_count = x$ambiguous_count,
+      missing_count = x$missing_count
+    )
+  }))
+  
+  return(list(raw = results, summary = df))
+}
+```
+
+### 4. MMHC Functions
+
+```{r}
+# -----------------------------------------------------------
+# MMHC FUNCTIONS
+# -----------------------------------------------------------
+
+evaluate_mmhc_once <- function(true_bn, data,
+                               score = "bic",
+                               test = "mi",
+                               alpha = 0.05,
+                               restart = 0,
+                               perturb = 1) {
+  
+  # True CPDAG
+  true_graph <- if (inherits(true_bn, "bn.fit")) bn.net(true_bn) else true_bn
+  true_cp <- cpdag(true_graph)
+  
+  # MMHC run with timing
+  t0 <- proc.time()
+  mmhc_fit <- tryCatch({
+    bnlearn::mmhc(
+      x = data,
+      restrict.args = list(
+        test = test,
+        alpha = alpha
+      ),
+      maximize.args = list(
+        score = score,
+        restart = restart,
+        perturb = perturb
+      )
+    )
+  }, error = function(e) {
+    stop("MMHC failed: ", e$message)
+  })
+  t1 <- proc.time()
+  
+  runtime_sec <- as.numeric((t1 - t0)["elapsed"])
+  
+  mmhc_cp <- cpdag(mmhc_fit)
+  
+  metrics <- calculate_evaluation_metrics(true_cp, mmhc_cp)
+  metrics$runtime_sec <- runtime_sec
+  metrics$pc_fit <- mmhc_cp
+  
+  return(metrics)
+}
+
+run_mmhc_replicates <- function(true_bn,
+                                sample_n = 1000,
+                                R = 30,
+                                score = "bic",
+                                test = "mi",
+                                alpha = 0.05,
+                                restart = 0,
+                                perturb = 1,
+                                seed = 123) {
+  
+  set.seed(seed)
+  results <- vector("list", R)
+  
+  for (r in seq_len(R)) {
+    
+    data_r <- rbn(true_bn, n = sample_n)
+    
+    results[[r]] <- evaluate_mmhc_once(
+      true_bn,
+      data_r,
+      score = score,
+      test = test,
+      alpha = alpha,
+      restart = restart,
+      perturb = perturb
+    )
+  }
+  
+  df <- do.call(rbind, lapply(results, function(x) {
+    data.frame(
+      full_shd = x$full_shd,
+      skeleton_shd = x$skeleton_shd,
+      orientation_shd = x$orientation_shd,
+      normalized_by_true = x$normalized_by_true_edges,
+      normalized_by_possible = x$normalized_by_possible,
+      normalized_orientation = x$normalized_orientation_shd,
+      normalized_skeleton_shd = x$normalized_skeleton_shd,
+      precision = x$precision,
+      recall = x$recall,
+      runtime_sec = x$runtime_sec,
+      reversal_count = x$reversal_count,
+      ambiguous_count = x$ambiguous_count,
+      missing_count = x$missing_count
+    )
+  }))
+  
+  return(list(raw = results, summary = df))
+}
+```
+
+### 5. Edge recovery functions
+
+```{r}
+# -----------------------------------------------------------
+# Function to determine how often each true edge recovered across replicates
+# -----------------------------------------------------------
+
+edge_recovery_frequency <- function(true_bn, results_list) {
+  
+  # results_list: output$raw from run_pc_replicates
+  
+  # Get true graph as CPDAG and get adjacency matrix
+  true_graph <- if (inherits(true_bn, "bn.fit")) bn.net(true_bn) else true_bn
+  true_cp <- cpdag(true_graph)
+  true_amat <- (amat(true_cp) + t(amat(true_cp))) > 0
+
+  # Get number of nodes and names
+  nodes <- colnames(true_amat)
+  p <- length(nodes)
+  
+  # Get count of nodes that have edges connected to them
+  edge_list <- which(true_amat, arr.ind = TRUE)
+  # Take only upper triangle to have each undirected edge once
+  edge_list <- edge_list[edge_list[,1] < edge_list[,2], , drop = FALSE]
+  edge_names <- apply(edge_list, 1, function(ix) paste0(nodes[ix[1]], "--", nodes[ix[2]]))
+
+  freq <- numeric(length(edge_names))
+  # Get frequency and proportion of which each edge was found in the learnt graph
+  for (r in seq_along(results_list)) {
+    pc_fit <- results_list[[r]]$pc_fit
+    learned_amat <- (amat(pc_fit) + t(amat(pc_fit))) > 0
+    for (i in seq_along(edge_names)) {
+      ix <- edge_list[i, ]
+      if (learned_amat[ix[1], ix[2]]) freq[i] <- freq[i] + 1
+    }
+  }
+  data.frame(edge = edge_names, freq = freq, prop = freq / length(results_list), stringsAsFactors = FALSE)
+}
+```
+
+### 6. Alpha sensitivity functions
+
+```{r}
+run_alpha_sensitivity_tests <- function(network,
+                                        sample_sizes,
+                                        alphas,
+                                        R = 25,
+                                        test = "mi",
+                                        max.sx = 3,
+                                        seed_offset = 200,
+                                        algorithm = "PC") {
+  
+  # Choose replicate function based on algorithm
+  replicate_fun <- switch(
+    algorithm,
+    PC = function(...) run_pc_replicates(..., max.sx = max.sx),
+    MMHC = run_mmhc_replicates,
+    stop("Unsupported algorithm: ", algorithm)
+  )
+  
+  alpha_results <- lapply(sample_sizes, function(n) {
+    lapply(alphas, function(a) {
+      
+      res <- replicate_fun(
+        network,
+        sample_n = n,
+        R = R,
+        test = test,
+        alpha = a,
+        seed = seed_offset + round(a * 100) + n
+      )
+      
+      cbind(
+        sample_size = n,
+        alpha = a,
+        res$summary
+      )
+    })
+  })
+  
+  # Combine into one dataframe
+  alpha_results_df <- do.call(
+    rbind,
+    lapply(alpha_results, function(x) do.call(rbind, x))
+  )
+  
+  # Summarise
+  alpha_summary <- alpha_results_df %>%
+    dplyr::group_by(alpha, sample_size) %>%
+    dplyr::summarise(
+      mean_skeleton_shd = mean(skeleton_shd),
+      mean_orientation_shd = mean(orientation_shd),
+      mean_precision = mean(precision),
+      mean_recall = mean(recall),
+      mean_norm_shd = mean(normalized_by_true),
+      .groups = "drop"
+    )
+  
+  list(
+    raw_results = alpha_results_df,
+    summary = alpha_summary
+  )
+}
+```
+
+### 7. Objective function sensitivity functions
+
+```{r}
+run_objective_sensitivity_tests <- function(network,
+                                            sample_sizes,
+                                            scores,
+                                            R = 25,
+                                            restart = 0,
+                                            perturb = 1,
+                                            seed_offset = 500,
+                                            algorithm = "MMHC") {
+  
+  # Choose replicate function based on algorithm
+  replicate_fun <- switch(
+    algorithm,
+    MMHC = run_mmhc_replicates,
+    HC   = run_hc_replicates,
+    stop("Unsupported algorithm: ", algorithm)
+  )
+  
+  objective_results <- lapply(sample_sizes, function(n) {
+    lapply(scores, function(s) {
+      
+      res <- replicate_fun(
+        network,
+        sample_n = n,
+        R = R,
+        score = s,
+        restart = restart,
+        perturb = perturb,
+        seed = seed_offset + which(scores == s)
+      ) # alpha and test in MMHC set to default value of 0.05 and "mi" respectively 
+      
+      cbind(
+        sample_size = n,
+        score = s,
+        res$summary
+      )
+    })
+  })
+  
+  # Combine into one dataframe
+  objective_results_df <- do.call(
+    rbind,
+    lapply(objective_results, function(x) do.call(rbind, x))
+  )
+  
+  # Summarise
+  objective_summary <- objective_results_df %>%
+    dplyr::group_by(score, sample_size) %>%
+    dplyr::summarise(
+      mean_skeleton_shd = mean(skeleton_shd),
+      mean_orientation_shd = mean(orientation_shd),
+      mean_norm_shd = mean(normalized_by_true),
+      .groups = "drop"
+    )
+  
+  list(
+    raw_results = objective_results_df,
+    summary = objective_summary
+  )
+}
+```
+
+# Helper functions
+
+```{r}
+# Function to assign bands
+assign_band <- function(x) {
+  case_when(
+    x == 1            ~ "100%",
+    x >= 0.8          ~ "80-100%",
+    x >= 0.4          ~ "40-80%",
+    x > 0             ~ "0-40%",
+    x == 0            ~ "0%"
+  )
+}
+```
+
+# Function to find the separating set - replicating the process of the PC algorithm
+
+```{r}
+find_sepset <- function(data, X, Y, max_k = 3, alpha = 0.05, test = "mi") {
+  
+  vars <- setdiff(names(data), c(X, Y))
+  
+  for (k in 0:min(max_k, length(vars))) {
+    # Handle empty conditioning set separately
+    if (k == 0) {
+      ci <- ci.test(x = X, y = Y, data = data, test = test)
+      
+      if (ci$p.value > alpha) {
+        return(list(
+          separating_set = character(0),
+          p_value = ci$p.value,
+          k = 0
+        ))
+      }
+      
+    } else {
+      combs <- combinations(n = length(vars), r = k, v = vars)
+      for (i in 1:nrow(combs)) {
+        S <- combs[i, ]
+        
+        ci <- ci.test(x = X, y = Y, z = S, data = data, test = test)
+        
+        if (ci$p.value > alpha) {
+          return(list(
+            separating_set = S,
+            p_value = ci$p.value,
+            k = k
+          ))
+        }
+      }
+    }
+  }
+  return(NULL)
+}
+```
+
+# Runtime functions
+
+```{r}
+run_replicates <- function(run_fun, R = 30) {
+  
+  results <- vector("list", R)
+  runtimes <- numeric(R)
+  
+  for (i in seq_len(R)) {
+    res <- run_fun()
+    results[[i]] <- res
+    runtimes[i] <- res$runtime_sec
+  }
+  
+  list(
+    results = results,
+    runtimes = runtimes,
+    avg_runtime = mean(runtimes),
+    sd_runtime = sd(runtimes)
+  )
+}
+```
+
